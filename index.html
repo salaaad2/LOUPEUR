@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Looper Pedal Online — 4-Track Browser Loop Station</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="banner" class="banner" hidden></div>
+
+<header class="header">
+  <h1>Looper Pedal Online <span class="sub">4-Track Browser Loop Station</span></h1>
+  <span class="badge">Free Tool · No Signup</span>
+</header>
+
+<main class="wrap">
+
+  <section class="panel controls">
+    <div class="control">
+      <label for="bpm">BPM <output id="bpmOut">100</output></label>
+      <input type="range" id="bpm" min="60" max="180" step="1" value="100">
+    </div>
+
+    <div class="control">
+      <label for="bars">Bars per loop</label>
+      <select id="bars">
+        <option value="1">1</option>
+        <option value="2">2</option>
+        <option value="4" selected>4</option>
+        <option value="8">8</option>
+      </select>
+    </div>
+
+    <div class="control">
+      <label>Mode</label>
+      <div class="segmented" id="mode">
+        <button type="button" data-mode="free" class="on">Free</button>
+        <button type="button" data-mode="tempo">Tempo Lock</button>
+      </div>
+    </div>
+
+    <div class="control">
+      <label for="click">Click track</label>
+      <label class="switch"><input type="checkbox" id="click" checked><span></span></label>
+    </div>
+  </section>
+
+  <section class="tracks" id="tracks"></section>
+
+  <section class="panel output">
+    <div class="control">
+      <label for="reverb">Reverb</label>
+      <label class="switch"><input type="checkbox" id="reverb"><span></span></label>
+    </div>
+    <div class="control grow">
+      <label for="master">Master <output id="masterOut">85</output></label>
+      <input type="range" id="master" min="0" max="100" step="1" value="85">
+    </div>
+    <button type="button" id="export" class="btn export">Export Mix</button>
+  </section>
+
+  <section class="panel help">
+    <p id="modeHelp">Free Mode: the first take sets the loop length. Later tracks must match it.</p>
+    <p class="keys">
+      <kbd>R</kbd> record / punch out &nbsp;·&nbsp;
+      <kbd>1</kbd>–<kbd>4</kbd> select track &nbsp;·&nbsp;
+      <kbd>Space</kbd> stop / resume
+    </p>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
