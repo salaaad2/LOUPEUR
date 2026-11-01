@@ -93,8 +93,9 @@ from that one value. Do not "fix" the 8 ms discrepancy; it is intentional.
 - **Free Mode, first take:** `armCapture(ch, startAt, Infinity, 0)` — free-running,
   length fixed at punch-out. `finishCapture` sets `state.loopLength` and back-dates
   `state.t0` to the first captured frame.
-- **Free Mode, later tracks:** capture window is exactly `L + seam`, started at the next
-  boundary. The take must match within `FREE_TOLERANCE` (50 ms) or it is rejected.
+- **Free Mode, later tracks:** punch in at the loop top (see §3.5). The take is armed
+  immediately, capture opens at the next boundary, and the window is exactly `L + seam`.
+  The take must match within `FREE_TOLERANCE` (50 ms) or it is rejected.
 - **Tempo Lock:** `L = bars × 4 × (60/BPM) × sampleRate`, minus the seam. 4 clicks of
   count-in, capture arms on beat 5, auto-stops at the end of the window.
 
@@ -102,8 +103,13 @@ from that one value. Do not "fix" the 8 ms discrepancy; it is intentional.
 
 `capture-worklet.js` posts `{frame, data}` per 128-sample block. `frame` is derived from
 the worklet's `currentFrame` global (the AudioContext frame counter), so indices line up
-with `ctx.currentTime * sampleRate`. The first block that arrives defines the real start
-of the take — the predicted `startFrame` is only a lower bound.
+with `ctx.currentTime * sampleRate`.
+
+`armCapture` stores `startFramePredicted = round(startTime * sampleRate)`. The take is
+anchored to that frame, not to the first block that happens to arrive: `onCaptureFrame`
+drops any block that ends at or before it and sets `startFrame = max(frame,
+startFramePredicted)`. This is what makes an armed take begin exactly on the loop
+boundary instead of a block late.
 
 `onCaptureFrame` copies the block into `pendingRecord.scratch` at
 `frame - startFrame`, tracks `lastFrame`, folds the block into `liveEnv` (see §4), and
@@ -113,11 +119,35 @@ calls `finishCapture()` when the window is full.
 
 ```
 EMPTY ──record──► RECORDING ──auto/punch──► PLAYING ──overdub──► OVERDUBBING ──► PLAYING
-   ▲                                                                              │
-   └──────────────────────────── CLEAR (long-press) ──────────────────────────────┘
+   ▲                  ▲                                                          │
+   │                  │                                                          │
+   │            ARMED ┘  (later Free Mode track only)                            │
+   │              │                                                              │
+   └──────────────┴──────────────── CLEAR (long-press) ───────────────────────────┘
 ```
 
 Per-channel object: `{index, state, buffer, gain, source, muted, layers, env, envBuffer}`.
+
+**ARMED — punch in at the loop top.** When a later Free Mode track is recorded, the
+press does not start capture. The channel enters `armed`, and capture opens at the next
+loop boundary, which is also loop sample 0. The button reads `ARMED` in accent blue
+(`WAVE_COLORS.armed`). Pressing again cancels back to `EMPTY`.
+
+This exists because the alternative — capture from the press and anchor the buffer at
+index 0 — makes the take play back shifted by the press-to-boundary distance, so the
+mix does not match what the user heard while recording. Do not reintroduce a start
+offset or a buffer rotation: the take is anchored to the boundary, and that is the whole
+fix. A rotation keyed off `nextBoundaryTime` can never fire, because that function
+returns `t0 + n·L` by construction.
+
+`promoteArmed()` flips `armed → recording` once `ctx.currentTime >= rec.startTime`. It
+runs on its own 25 ms timer (`startArmTimer`/`stopArmTimer`), **not** from
+`scheduleAhead`, so an armed take still promotes if the transport is stopped underneath
+it. Driving it off the first captured block instead would flip the label a few
+milliseconds late and make the state invisible.
+
+If the transport is stopped when a later track is armed, `t0` is stale and there is no
+boundary to wait for, so `beginRecord` restarts the transport first.
 
 - **Mute:** `toggleMute` schedules a hold at the current value, then a 10 ms linear ramp
   at the next boundary. Unmute mirrors it.
@@ -166,12 +196,16 @@ a deliberate change to `drawWave`'s recording branch, not a bug fix.
 
 ## 5. Recording rules (deliberate, do not "fix")
 
-- **A later Free Mode track cannot be punched out.** Its length is fixed by the first
-  take; stopping early would leave a short take that cannot loop. `punchOut` shows a
-  banner ("This track records for the full loop length. It stops on its own."), the
-  button reads `RECORDING…` and is `disabled`, and keyboard `R` hits the same guard.
-  `render()` computes this as `locked = ch.state === "recording" && pendingRecord &&
-  !pendingRecord.freeMode`.
+- **A later Free Mode track punches in at the loop top.** See §3.5. The take is silent
+  for the part of the loop that played before capture began; that is correct, because
+  the user was not recording then.
+- **A later Free Mode track cannot be punched out once recording.** Its length is fixed
+  by the first take; stopping early would leave a short take that cannot loop.
+  `punchOut` shows a banner ("This track records for the full loop length. It stops on
+  its own."), the button reads `RECORDING…` and is `disabled`, and keyboard `R` hits the
+  same guard. `render()` computes this as `locked = ch.state === "recording" &&
+  pendingRecord && !pendingRecord.freeMode`. Note `locked` matches `"recording"` only,
+  so an `armed` take stays clickable — cancelling it is the only way out.
 - **The first Free Mode take can be punched out** at any time; the length is whatever
   was captured up to the last received frame. Takes under 0.5 s are rejected.
 - **Tempo Lock takes always run the full bar count** and auto-stop; pressing the button

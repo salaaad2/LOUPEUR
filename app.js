@@ -44,6 +44,7 @@ let micStream = null;
 let captureNode = null;
 let captureReady = false;
 let schedulerTimer = null;
+let armTimer = null;         // promotes an armed take at its loop boundary
 let nextBoundaryIndex = 0;   // next loop index to schedule
 let pendingRecord = null;    // { channel, startFrame, endFrame } while capturing
 let liveEnv = null;          // envelope of the take in progress, for the waveform
@@ -213,11 +214,13 @@ function onCaptureFrame(e) {
   const { frame, data } = e.data;
   const rec = pendingRecord;
 
-  // The first block that arrives defines the real start of the take. The
-  // predicted startFrame is only a lower bound; audio cannot exist before it.
+  // The take starts at the first block that overlaps the capture window. For
+  // an armed take the window opens at a loop boundary, so blocks that arrive
+  // before it are dropped and the take is anchored to the boundary itself.
   if (rec.startFrame === null) {
-    rec.startFrame = frame;
-    if (rec.endFrame !== Infinity) rec.endFrame = frame + rec.lengthSamples;
+    if (frame + data.length <= rec.startFramePredicted) return;
+    rec.startFrame = Math.max(frame, rec.startFramePredicted);
+    if (rec.endFrame !== Infinity) rec.endFrame = rec.startFrame + rec.lengthSamples;
   }
 
   const start = rec.startFrame;
@@ -357,6 +360,33 @@ function scheduleAhead() {
   }
 }
 
+// An armed track becomes RECORDING once the loop top it was waiting for has
+// arrived. Driven by the transport clock, not by the first captured block:
+// the worklet delivers blocks asynchronously, so keying off audio would flip
+// the label a few milliseconds late and make the state invisible.
+//
+// This runs on its own timer rather than from scheduleAhead, because an armed
+// take must still promote if the transport is stopped underneath it.
+function promoteArmed() {
+  const rec = pendingRecord;
+  if (!rec || rec.channel.state !== "armed") return;
+  if (ctx.currentTime < rec.startTime) return;
+  rec.channel.state = "recording";
+  render();
+}
+
+function startArmTimer() {
+  if (armTimer) return;
+  armTimer = setInterval(promoteArmed, LOOKAHEAD_MS);
+}
+
+function stopArmTimer() {
+  if (armTimer) {
+    clearInterval(armTimer);
+    armTimer = null;
+  }
+}
+
 function scheduleChannel(ch, when) {
   if (!ch.buffer) return;
   // Retire the previous source so they do not accumulate.
@@ -392,13 +422,20 @@ async function beginRecord(ch) {
     ch.state = "recording";
   } else {
     if (state.loopLength) {
-      // Later track: must match the existing loop exactly. Capture the
-      // pre-fold length so the seam fold lands back on L.
+      // Later track: punch in at the loop top. The take is armed now and
+      // capture begins at the next loop boundary, which is also sample 0 of
+      // the loop, so what the user hears while recording is what plays back.
       const L = state.loopLength;
       const raw = L + seamSamples(L);
+      // If the transport is stopped, t0 is stale and there is no boundary to
+      // wait for: restart the loop from the top and record from there.
+      if (state.transport !== "running") {
+        startTransport(ctx.currentTime + 0.05);
+      }
       const startAt = nextBoundaryTime(ctx.currentTime + 0.05);
       armCapture(ch, startAt, startAt + raw / ctx.sampleRate, raw);
-      ch.state = "recording";
+      ch.state = "armed";
+      startArmTimer();
     } else {
       // First take: free-running, length fixed at punch-out.
       const startAt = ctx.currentTime + 0.05;
@@ -415,12 +452,18 @@ function armCapture(ch, startTime, endTime, lengthSamples) {
     channel: ch,
     // Resolved from the first captured block; see onCaptureFrame.
     startFrame: null,
+    // Frame the capture window opens at. Blocks before it are discarded, so
+    // an armed take begins exactly at the loop boundary.
+    startFramePredicted: Math.round(startTime * ctx.sampleRate),
     lastFrame: null,
     endFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate),
     lengthSamples: lengthSamples || 0,
     scratch: new Float32Array(cap),
     freeMode: state.mode === "free" && !state.loopLength,
     overdub: false,
+    // AudioContext time the capture window opens. An armed take waits for
+    // this before it counts as recording.
+    startTime,
     envTotal: 0,      // samples the live envelope currently spans
   };
   liveEnv = new Float32Array(WAVE_BUCKETS);
@@ -431,6 +474,7 @@ function finishCapture() {
   if (!rec) return;
   pendingRecord = null;
   liveEnv = null;
+  stopArmTimer();
 
   const ch = rec.channel;
   const rate = ctx.sampleRate;
@@ -456,9 +500,16 @@ function finishCapture() {
 
     // A later Free Mode take must match the existing loop. The capture window
     // is already L + n samples, so a take that ended early means the user
-    // punched out before the loop finished.
+    // punched out before the loop finished. An armed take that never reached
+    // its boundary has no startFrame at all.
     if (state.mode === "free" && rec.endFrame !== Infinity) {
-      const got = rec.endFrame - (rec.startFrame === null ? rec.endFrame : rec.startFrame);
+      if (rec.startFrame === null) {
+        ch.state = "empty";
+        showBanner("That take did not match the loop length. Try again.");
+        render();
+        return;
+      }
+      const got = rec.endFrame - rec.startFrame;
       const want = length + seamSamples(length);
       if (Math.abs(got - want) > FREE_TOLERANCE * rate) {
         ch.state = "empty";
@@ -496,6 +547,17 @@ function finishCapture() {
 }
 
 function punchOut(ch) {
+  if (ch.state === "armed") {
+    // Nothing has been captured yet: cancel the take and return to EMPTY.
+    if (pendingRecord && pendingRecord.channel === ch) {
+      pendingRecord = null;
+      liveEnv = null;
+      stopArmTimer();
+    }
+    ch.state = "empty";
+    render();
+    return;
+  }
   if (ch.state === "recording") {
     if (state.mode === "tempo") {
       // Auto-stop is handled by the capture window; nothing to do.
@@ -770,6 +832,7 @@ function envelopeFor(ch) {
 
 const WAVE_COLORS = {
   empty: "#3a4152",
+  armed: "#5b8def",
   recording: "#e5484d",
   playing: "#30a46c",
   overdubbing: "#f5a524",
@@ -931,6 +994,7 @@ async function onPrimary(i) {
   state.selected = i;
 
   if (ch.state === "empty") await beginRecord(ch);
+  else if (ch.state === "armed") punchOut(ch);
   else if (ch.state === "recording") punchOut(ch);
   else if (ch.state === "playing") beginOverdub(ch);
   else if (ch.state === "overdubbing") punchOut(ch);
@@ -961,6 +1025,7 @@ function render() {
     const locked = ch.state === "recording" && pendingRecord && !pendingRecord.freeMode;
     const labels = {
       empty: "RECORD",
+      armed: "ARMED",
       recording: locked ? "RECORDING…" : "STOP REC",
       playing: "OVERDUB",
       overdubbing: "STOP DUB",

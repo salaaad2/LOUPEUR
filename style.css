@@ -276,6 +276,7 @@ select {
 .primary:disabled { cursor: default; }
 .primary:disabled:hover { border-color: var(--rec); }
 
+.primary[data-state="armed"] { background: var(--accent); border-color: var(--accent); color: #fff; }
 .primary[data-state="recording"] { background: var(--rec); border-color: var(--rec); color: #fff; }
 .primary[data-state="playing"] { background: var(--play); border-color: var(--play); color: #fff; }
 .primary[data-state="overdubbing"] { background: var(--dub); border-color: var(--dub); color: #1a1200; }
