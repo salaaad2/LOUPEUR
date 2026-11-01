@@ -46,6 +46,7 @@ let captureReady = false;
 let schedulerTimer = null;
 let nextBoundaryIndex = 0;   // next loop index to schedule
 let pendingRecord = null;    // { channel, startFrame, endFrame } while capturing
+let liveEnv = null;          // envelope of the take in progress, for the waveform
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -112,6 +113,8 @@ async function initAudio() {
       source: null,
       muted: false,
       layers: 0,
+      env: null,        // cached waveform envelope
+      envBuffer: null,  // buffer the envelope was computed from
     });
   }
 
@@ -231,9 +234,37 @@ function onCaptureFrame(e) {
   target.set(data.subarray(offset, offset + count), writeAt);
   rec.lastFrame = to - 1;
 
+  // Fold the new samples into the live envelope so the waveform fills in as
+  // the take arrives. Buckets are fixed, so the envelope is rescaled to the
+  // captured length on every block: one pass over 200 floats, not the take.
+  const buckets = liveEnv.length;
+  const total = writeAt + count;
+  const prev = liveEnv.slice();
+  const prevTotal = rec.envTotal || 0;
+  liveEnv.fill(0);
+  for (let b = 0; b < buckets; b++) {
+    const from2 = Math.floor((b * total) / buckets);
+    const to2 = Math.min(total, Math.floor(((b + 1) * total) / buckets));
+    let peak = 0;
+    // Carry over the peak of the old bucket that overlaps this one.
+    if (prevTotal > 0) {
+      const pFrom = Math.floor((b * prevTotal) / buckets);
+      const pTo = Math.min(prevTotal, Math.floor(((b + 1) * prevTotal) / buckets));
+      for (let i = pFrom; i < pTo; i++) {
+        const v = prev[Math.min(buckets - 1, Math.floor((i * buckets) / prevTotal))];
+        if (v > peak) peak = v;
+      }
+    }
+    for (let i = from2; i < to2; i++) {
+      const v = target[i] < 0 ? -target[i] : target[i];
+      if (v > peak) peak = v;
+    }
+    liveEnv[b] = peak;
+  }
+  rec.envTotal = total;
+
   if (to >= end) finishCapture();
 }
-
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
@@ -390,13 +421,16 @@ function armCapture(ch, startTime, endTime, lengthSamples) {
     scratch: new Float32Array(cap),
     freeMode: state.mode === "free" && !state.loopLength,
     overdub: false,
+    envTotal: 0,      // samples the live envelope currently spans
   };
+  liveEnv = new Float32Array(WAVE_BUCKETS);
 }
 
 function finishCapture() {
   const rec = pendingRecord;
   if (!rec) return;
   pendingRecord = null;
+  liveEnv = null;
 
   const ch = rec.channel;
   const rate = ctx.sampleRate;
@@ -480,9 +514,11 @@ function punchOut(ch) {
       rec.endFrame = rec.lastFrame === null ? rec.startFrame : rec.lastFrame + 1;
       finishCapture();
     } else {
-      // Later Free Mode track: stop at the next loop boundary.
-      const stopAt = nextBoundaryTime(ctx.currentTime);
-      pendingRecord.endFrame = Math.round(stopAt * ctx.sampleRate);
+      // Later Free Mode track: the loop length is already fixed by the first
+      // take, so this take runs to the end of the loop on its own. Punching
+      // out early would leave a short take that cannot be looped, so the
+      // press is ignored.
+      showBanner("This track records for the full loop length. It stops on its own.");
     }
   } else if (ch.state === "overdubbing") {
     if (!pendingRecord) return;
@@ -563,6 +599,8 @@ function clearChannel(ch) {
   ch.layers = 0;
   ch.state = "empty";
   ch.muted = false;
+  ch.envBuffer = null;
+  ch.env = null;
   const g = ch.gain.gain;
   g.cancelScheduledValues(ctx.currentTime);
   g.setValueAtTime(1, ctx.currentTime);
@@ -696,6 +734,136 @@ function download(blob, name) {
 }
 
 // ---------------------------------------------------------------------------
+// Waveform display
+// ---------------------------------------------------------------------------
+
+const WAVE_BUCKETS = 200;
+
+// Reduces a Float32Array to per-bucket peak amplitudes in 0..1. Computed once
+// per buffer change, not per frame.
+function computeEnvelope(samples, buckets) {
+  const out = new Float32Array(buckets);
+  if (!samples || !samples.length) return out;
+  const per = samples.length / buckets;
+  for (let b = 0; b < buckets; b++) {
+    const from = Math.floor(b * per);
+    const to = Math.min(samples.length, Math.floor((b + 1) * per));
+    let peak = 0;
+    for (let i = from; i < to; i++) {
+      const v = samples[i] < 0 ? -samples[i] : samples[i];
+      if (v > peak) peak = v;
+    }
+    out[b] = peak;
+  }
+  return out;
+}
+
+// Cached envelope per channel, keyed by buffer identity so it is recomputed
+// only when the buffer is replaced.
+function envelopeFor(ch) {
+  if (!ch.buffer) return null;
+  if (ch.envBuffer === ch.buffer) return ch.env;
+  ch.envBuffer = ch.buffer;
+  ch.env = computeEnvelope(ch.buffer.getChannelData(0), WAVE_BUCKETS);
+  return ch.env;
+}
+
+const WAVE_COLORS = {
+  empty: "#3a4152",
+  recording: "#e5484d",
+  playing: "#30a46c",
+  overdubbing: "#f5a524",
+};
+
+function drawWave(ch, canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 200;
+  const cssH = canvas.clientHeight || 48;
+  if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+  }
+
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, cssW, cssH);
+
+  const mid = cssH / 2;
+  const color = WAVE_COLORS[ch.state] || WAVE_COLORS.empty;
+
+  // Centre line.
+  g.strokeStyle = "#252a36";
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(0, mid + 0.5);
+  g.lineTo(cssW, mid + 0.5);
+  g.stroke();
+
+  // While recording, show the take as it arrives.
+  let env = envelopeFor(ch);
+  if (ch.state === "recording" && pendingRecord && pendingRecord.channel === ch) {
+    const rec = pendingRecord;
+    const filled = rec.lastFrame === null || rec.startFrame === null
+      ? 0
+      : rec.lastFrame - rec.startFrame + 1;
+    // liveEnv is accumulated block by block in onCaptureFrame, so it already
+    // spans exactly the captured region: draw all of it. Scaling by
+    // filled / scratch.length would shrink the picture to nothing, because in
+    // Free Mode the scratch buffer is the full 8-minute maximum.
+    drawEnvelope(g, liveEnv, cssW, cssH, mid, color);
+
+    // Progress against the maximum take length, so elapsed time is visible
+    // even though the waveform itself always fills the width.
+    const total = rec.lengthSamples || Math.ceil(ctx.sampleRate * MAX_TAKE_SECONDS);
+    const frac = Math.max(0, Math.min(1, filled / total));
+    g.fillStyle = color;
+    g.fillRect(0, cssH - 2, cssW * frac, 2);
+  } else if (env) {
+    drawEnvelope(g, env, cssW, cssH, mid, color);
+  }
+
+  // Playhead during playback.
+  if (state.transport === "running" && state.loopLength && ch.buffer) {
+    const L = state.loopLength / ctx.sampleRate;
+    const pos = (((ctx.currentTime - state.t0) % L) + L) % L / L;
+    g.strokeStyle = "rgba(255,255,255,0.55)";
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(Math.round(pos * cssW) + 0.5, 2);
+    g.lineTo(Math.round(pos * cssW) + 0.5, cssH - 2);
+    g.stroke();
+  }
+}
+
+function drawEnvelope(g, env, cssW, cssH, mid, color) {
+  const barW = cssW / env.length;
+  g.fillStyle = color;
+  for (let i = 0; i < env.length; i++) {
+    const amp = Math.min(1, env[i]) * (mid - 2);
+    if (amp <= 0.5) continue;
+    g.fillRect(i * barW, mid - amp, Math.max(1, barW - 0.5), amp * 2);
+  }
+}
+
+let waveRaf = null;
+
+function startWaveLoop() {
+  if (waveRaf !== null) return;
+  const tick = () => {
+    waveRaf = requestAnimationFrame(tick);
+    if (!ctx) return;
+    for (let i = 0; i < TRACK_COUNT; i++) {
+      const ch = state.channels[i];
+      const tile = el.tracks.children[i];
+      if (!ch || !tile) continue;
+      const canvas = tile.querySelector("canvas.wave");
+      if (canvas) drawWave(ch, canvas);
+    }
+  };
+  waveRaf = requestAnimationFrame(tick);
+}
+
+// ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
 
@@ -709,6 +877,7 @@ function buildTracks() {
         <span class="track-name">Track ${i + 1}</span>
         <span class="layers" data-layers="${i}">0</span>
       </div>
+      <canvas class="wave" data-wave="${i}"></canvas>
       <button type="button" class="primary" data-primary="${i}">RECORD</button>
       <div class="track-foot">
         <button type="button" class="small" data-mute="${i}">MUTE</button>
@@ -787,14 +956,18 @@ function render() {
     tile.classList.toggle("selected", state.selected === i);
 
     const primary = tile.querySelector("[data-primary]");
+    // A later Free Mode track cannot be punched out: its length is fixed by
+    // the first take, so the button only reports progress.
+    const locked = ch.state === "recording" && pendingRecord && !pendingRecord.freeMode;
     const labels = {
       empty: "RECORD",
-      recording: "STOP REC",
+      recording: locked ? "RECORDING…" : "STOP REC",
       playing: "OVERDUB",
       overdubbing: "STOP DUB",
     };
     primary.textContent = labels[ch.state] || "RECORD";
     primary.dataset.state = ch.state;
+    primary.disabled = Boolean(locked);
 
     const mute = tile.querySelector("[data-mute]");
     mute.classList.toggle("latched", ch.muted);
@@ -914,6 +1087,7 @@ function boot() {
   buildTracks();
   bindControls();
   render();
+  startWaveLoop();
 
   if (!window.AudioContext && !window.webkitAudioContext) {
     showBanner("This browser does not support the Web Audio API.");
