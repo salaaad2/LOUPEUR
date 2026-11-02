@@ -116,6 +116,7 @@ async function initAudio() {
       layers: 0,
       env: null,        // cached waveform envelope
       envBuffer: null,  // buffer the envelope was computed from
+      anchorTime: null, // loop time the buffer starts at, null = loop top
     });
   }
 
@@ -286,6 +287,10 @@ function seamSamples(length) {
   return Math.min(Math.round(SEAM_SECONDS * ctx.sampleRate), Math.floor(length / 2));
 }
 
+// First loop boundary at or after `after`. Used for mute ramps, later-track
+// record starts, overdub starts, and resume. Not used to start a take that has
+// already been recorded: its anchor may be in the past, and the next boundary
+// would then be a whole loop away. See schedulePending.
 function nextBoundaryTime(after) {
   const L = loopSamples() / ctx.sampleRate;
   if (!L) return after;
@@ -302,6 +307,44 @@ function startTransport(atTime) {
   const Lsec = loopSamples() / ctx.sampleRate;
   nextBoundaryIndex = Lsec ? Math.max(0, Math.ceil((ctx.currentTime - atTime) / Lsec)) : 0;
   startScheduler();
+  // Tracks that are already playing have no source after a stop; start them
+  // now rather than waiting for the scheduler to reach a boundary.
+  schedulePending();
+}
+
+// Starts every playing/overdubbing track that has no source yet. Called when
+// the transport starts or a take is committed, so a freshly recorded track is
+// heard immediately instead of after a full loop of silence.
+//
+// Every take is entered at the loop position the transport has already
+// reached, computed from its anchor. A take whose anchor is still ahead (a
+// later track armed at the loop top, committed before that boundary arrives)
+// waits for the boundary; one whose anchor has already gone by — the first
+// Free Mode take, or a later take that finished at the end of its window — is
+// entered right away. Waiting for the *next* boundary in that case would skip
+// a whole loop, which is the "full run before any sound" symptom.
+function schedulePending() {
+  if (state.transport !== "running" || !ctx) return;
+  const L = loopSamples();
+  if (!L) return;
+  const now = ctx.currentTime;
+  for (const ch of state.channels) {
+    if (!ch.buffer || ch.source) continue;
+    if (ch.state !== "playing" && ch.state !== "overdubbing") continue;
+    const anchor = ch.anchorTime || state.t0;
+    const when = anchor > now ? anchor : now;
+    scheduleChannel(ch, when, loopOffset(ch, when));
+  }
+}
+
+// Loop position, in samples, that a channel's buffer starts at when its
+// source is started at `when`, measured from the channel's anchor (its own
+// anchorTime, or the loop top).
+function loopOffset(ch, when) {
+  const anchor = ch.anchorTime || state.t0;
+  const L = loopSamples();
+  const elapsed = Math.round((when - anchor) * ctx.sampleRate);
+  return ((elapsed % L) + L) % L;
 }
 
 function stopTransport() {
@@ -351,9 +394,11 @@ function scheduleAhead() {
     const when = state.t0 + nextBoundaryIndex * Lsec;
     if (when >= ctx.currentTime - 0.01) {
       for (const ch of state.channels) {
-        if (ch.state === "playing" || ch.state === "overdubbing") {
-          scheduleChannel(ch, when);
-        }
+        if (ch.state !== "playing" && ch.state !== "overdubbing") continue;
+        // A source already running loops on its own; restarting it at every
+        // boundary would cut the take and re-enter it at the wrong offset.
+        if (ch.source) continue;
+        scheduleChannel(ch, when, loopOffset(ch, when));
       }
     }
     nextBoundaryIndex++;
@@ -387,7 +432,7 @@ function stopArmTimer() {
   }
 }
 
-function scheduleChannel(ch, when) {
+function scheduleChannel(ch, when, offset) {
   if (!ch.buffer) return;
   // Retire the previous source so they do not accumulate.
   if (ch.source) {
@@ -396,7 +441,15 @@ function scheduleChannel(ch, when) {
   const src = ctx.createBufferSource();
   src.buffer = ch.buffer;
   src.connect(ch.gain);
-  src.start(when);
+  // A source entered mid-loop plays the remainder of the buffer and then
+  // loops from its head, so the track stays aligned with the transport.
+  src.loop = true;
+  src.start(when, offset || 0);
+  // Drop the reference once the source ends, so a track that stopped on its
+  // own is treated as pending again instead of holding a dead source.
+  src.onended = () => {
+    if (ch.source === src) ch.source = null;
+  };
   ch.source = src;
 }
 
@@ -523,6 +576,13 @@ function finishCapture() {
   if (rec.overdub) {
     commitOverdub(ch, rec.scratch);
     ch.state = "playing";
+    // The running source still plays the pre-overdub buffer; retire it so the
+    // new one, with the added layer, is entered at the current loop position.
+    if (ch.source) {
+      try { ch.source.stop(); } catch (_) {}
+      ch.source = null;
+    }
+    schedulePending();
     render();
     return;
   }
@@ -543,6 +603,14 @@ function finishCapture() {
   ch.buffer = buf;
   ch.layers = 1;
   ch.state = "playing";
+  // Loop position the buffer starts at. A take recorded from the loop top is
+  // anchored to t0; the first Free Mode take is anchored to the frame capture
+  // actually began at, which is mid-loop, so playback enters it at the
+  // position the transport has already reached.
+  ch.anchorTime = rec.freeMode ? state.t0 : null;
+  // Enter the take at the loop position the transport has reached, instead of
+  // waiting for the next boundary, which is a whole loop away.
+  schedulePending();
   render();
 }
 
@@ -663,6 +731,7 @@ function clearChannel(ch) {
   ch.muted = false;
   ch.envBuffer = null;
   ch.env = null;
+  ch.anchorTime = null;
   const g = ch.gain.gain;
   g.cancelScheduledValues(ctx.currentTime);
   g.setValueAtTime(1, ctx.currentTime);

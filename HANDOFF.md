@@ -73,12 +73,43 @@ One `AudioContext` for everything. `initAudio()` is called from the first user g
 
 `scheduleAhead()` runs on a 25 ms `setInterval`, looks 100 ms ahead, and for each
 boundary inside the horizon calls `scheduleChannel()` for every channel in
-`playing`/`overdubbing`. `scheduleChannel` stops the previous source at `when` and
-starts a fresh `BufferSource` at `when`. This is the standard lookahead pattern: no
-`setTimeout` ever touches audio timing, so there is no drift.
+`playing`/`overdubbing` **that has no source**. A source that is already running loops
+on its own (`src.loop = true`), so re-scheduling it at every boundary would cut the take
+and re-enter it at the wrong offset. `scheduleChannel` starts a fresh `BufferSource` at
+`when` and `offset`, and clears `ch.source` in `onended`. This is the standard lookahead
+pattern: no `setTimeout` ever touches audio timing, so there is no drift.
 
 `nextBoundaryTime(after)` returns the first loop boundary at or after `after`. Used for
 mute ramps, later-track record starts, overdub starts, and resume.
+
+`schedulePending()` starts every `playing`/`overdubbing` channel that has no source. It
+is called from `startTransport()` and from `finishCapture()` (both the new-take and the
+overdub-commit paths). `scheduleChannel` clears `ch.source` in `onended`, so a source
+that stopped on its own is treated as pending again.
+
+**Loop offset.** `scheduleChannel(ch, when, offset)` starts the source at `offset`
+samples into the buffer with `src.loop = true`. `loopOffset(ch, when)` computes it from
+the channel's anchor — `ch.anchorTime`, or `state.t0` when that is `null` — as
+`(when - anchor) mod L`. Only the first Free Mode take sets `anchorTime` (to `state.t0`,
+which `finishCapture` back-dates to the frame capture began at); every other take is
+anchored to the loop top.
+
+**The "full loop of silence after punch-out" bug.** It had two causes, one per branch of
+`schedulePending`, and both are the same mistake: waiting for the *next* boundary when
+the take's own anchor had already gone by.
+
+- *First Free Mode take.* `finishCapture` sets `t0 = startFrame / rate`, which is
+  `press + 50 ms`, not a boundary. At punch-out the transport is already exactly one
+  loop past `t0`, so `nextBoundaryTime(now + 0.02)` returns `t0 + 2L`.
+- *Later tracks.* Capture is armed at a real boundary and runs `L + seam`, so
+  `finishCapture` fires just *after* that take's end boundary. `nextBoundaryTime` then
+  returns the following one, again a full loop away.
+
+The fix is one rule: `when = anchor > now ? anchor : now`, then start at
+`loopOffset(ch, when)`. A take whose anchor is still ahead waits for it; one whose
+anchor has passed is entered immediately at the position the transport has reached.
+`scheduleAhead` also skips channels that already have a source, because a looping source
+needs no re-scheduling and restarting it at each boundary would cut the take.
 
 ### 3.3 Loop length and the seam fold
 
@@ -234,6 +265,9 @@ focus is in an `input`/`select`/`textarea`.
   posting reports mid-session and the cause was never diagnosed. The user confirmed the
   feature works ("It seems ok") after the last fix, so treat the current behaviour as
   user-verified and the harness as broken.
+- **Playback-after-punch-out fix is user-verified** (2026-11-02): the first take and
+  later tracks both come back at the loop position the transport has reached, with no
+  full loop of silence. See §3.2.
 - Nothing is committed.
 
 ## 8. Environment gotchas
