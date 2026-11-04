@@ -27,6 +27,7 @@ const state = {
   clickOn: true,
   reverbOn: false,
   master: 0.85,
+  micId: "",             // "" = system default input
   selected: 0,
   transport: "stopped",  // "stopped" | "running"
   loopLength: 0,         // samples, 0 = undefined
@@ -61,6 +62,7 @@ const el = {
   bars: document.getElementById("bars"),
   mode: document.getElementById("mode"),
   click: document.getElementById("click"),
+  mic: document.getElementById("mic"),
   reverb: document.getElementById("reverb"),
   master: document.getElementById("master"),
   masterOut: document.getElementById("masterOut"),
@@ -169,12 +171,7 @@ async function ensureMic() {
   // must not leave captureReady false, or the next click re-prompts.
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-        channelCount: 1,
-      },
+      audio: micConstraints(),
     });
 
     await ctx.audioWorklet.addModule("capture-worklet.js");
@@ -187,6 +184,9 @@ async function ensureMic() {
     captureNode.port.onmessage = onCaptureFrame;
     source.connect(captureNode);
     captureReady = true;
+    // Labels are only readable once a stream has been granted, so the picker
+    // is filled here rather than at boot.
+    refreshMicList();
     return true;
   } catch (err) {
     releaseMic();
@@ -194,6 +194,12 @@ async function ensureMic() {
       showBanner("Microphone access was denied. Allow it in your browser settings and try again.");
     } else if (err && err.name === "NotFoundError") {
       showBanner("No microphone found. Connect one and try again.");
+    } else if (err && err.name === "OverconstrainedError") {
+      // The chosen device was unplugged between selection and capture. Drop
+      // it from the picker and fall back to the default input.
+      state.micId = "";
+      refreshMicList();
+      showBanner("That microphone is no longer available. Using the default input.");
     } else {
       showBanner("Could not start the microphone: " + (err && err.message ? err.message : err));
     }
@@ -201,12 +207,93 @@ async function ensureMic() {
   }
 }
 
+// Processing is off so the take is the raw signal. deviceId is only pinned
+// when the user picked a specific input; "" lets the browser follow the
+// system default, which is what a headset swap should do.
+function micConstraints() {
+  const audio = {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: 1,
+  };
+  if (state.micId) audio.deviceId = { exact: state.micId };
+  return audio;
+}
+
+// Fills the picker from enumerateDevices. Labels are empty until the page
+// holds a mic permission, so unnamed inputs fall back to "Microphone N".
+async function refreshMicList() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  let devices;
+  try {
+    devices = await navigator.mediaDevices.enumerateDevices();
+  } catch (_) {
+    return;
+  }
+  const inputs = devices.filter((d) => d.kind === "audioinput");
+  const options = ['<option value="">Default input</option>'];
+  inputs.forEach((d, i) => {
+    const label = d.label || `Microphone ${i + 1}`;
+    options.push(`<option value="${d.deviceId}">${escapeHtml(label)}</option>`);
+  });
+  el.mic.innerHTML = options.join("");
+  // A device that disappeared falls back to the default instead of leaving
+  // the select showing a value that no longer exists.
+  const known = inputs.some((d) => d.deviceId === state.micId);
+  if (!known) state.micId = "";
+  el.mic.value = state.micId;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[c]);
+}
+
+// Rebuilds the capture path on the newly chosen input. A take in progress is
+// cancelled: its samples came from the old device, so splicing two inputs
+// into one buffer would be wrong.
+async function switchMic(deviceId) {
+  if (deviceId === state.micId) return;
+  state.micId = deviceId;
+
+  if (pendingRecord) {
+    const ch = pendingRecord.channel;
+    pendingRecord = null;
+    liveEnv = null;
+    stopArmTimer();
+    ch.state = "empty";
+    showBanner("Recording cancelled: the microphone changed.");
+  }
+
+  if (!captureReady) {
+    // Nothing has been opened yet; the choice is applied on the first record.
+    render();
+    return;
+  }
+
+  releaseMic();
+  const ok = await ensureMic();
+  if (!ok) {
+    // ensureMic reported the failure and, for a vanished device, already
+    // reset micId and rebuilt the list. Re-sync the picker either way so it
+    // never shows a device that is not actually open.
+    el.mic.value = state.micId;
+  }
+  render();
+}
+
 function releaseMic() {
   if (micStream) {
     for (const track of micStream.getTracks()) track.stop();
     micStream = null;
   }
-  captureNode = null;
+  if (captureNode) {
+    captureNode.port.onmessage = null;
+    captureNode.disconnect();
+    captureNode = null;
+  }
   captureReady = false;
 }
 
@@ -1158,6 +1245,18 @@ function bindControls() {
   el.click.addEventListener("change", () => {
     state.clickOn = el.click.checked;
   });
+
+  el.mic.addEventListener("change", () => {
+    switchMic(el.mic.value).catch((err) => showBanner("Could not switch microphone: " + err.message));
+  });
+
+  // Plugging or unplugging an input changes the list; labels also become
+  // readable the moment the permission is granted.
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener("devicechange", () => {
+      refreshMicList();
+    });
+  }
 
   el.reverb.addEventListener("change", () => {
     state.reverbOn = el.reverb.checked;

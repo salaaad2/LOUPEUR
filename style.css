@@ -133,6 +133,13 @@ select {
   font: inherit;
 }
 
+/* Device labels are long ("Headset Microphone (Bluetooth)"), so the picker
+   gets a wider column and truncates instead of stretching the panel. */
+#mic {
+  max-width: 220px;
+  text-overflow: ellipsis;
+}
+
 .segmented {
   display: inline-flex;
   background: var(--panel-2);
