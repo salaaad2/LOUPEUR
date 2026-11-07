@@ -31,7 +31,7 @@ const EXPORT_TAIL = 1;           // seconds of reverb tail
 const state = {
   mode: "tempo",         // "free" | "tempo"
   bpm: 100,
-  bars: 4,
+  bars: 1,
   clickOn: true,
   reverbOn: false,
   master: 0.85,

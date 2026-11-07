@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Looper Pedal Online — 4-Track Browser Loop Station</title>
+<title>Loupeur</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,7 +11,7 @@
 <div id="banner" class="banner" hidden></div>
 
 <header class="header">
-  <h1>Looper Pedal Online <span class="sub">4-Track Browser Loop Station</span></h1>
+  <h1>Loupeur</h1>
   <span class="badge">Free Tool · No Signup</span>
 </header>
 
@@ -26,9 +26,9 @@
     <div class="control">
       <label for="bars">Bars per loop</label>
       <select id="bars">
-        <option value="1">1</option>
+        <option value="1" selected>1</option>
         <option value="2">2</option>
-        <option value="4" selected>4</option>
+        <option value="4">4</option>
         <option value="8">8</option>
       </select>
     </div>
@@ -36,8 +36,8 @@
     <div class="control">
       <label>Mode</label>
       <div class="segmented" id="mode">
-        <button type="button" data-mode="free">Free</button>
         <button type="button" data-mode="tempo" class="on">Tempo Lock</button>
+        <button type="button" data-mode="free">Free</button>
       </div>
     </div>
 
