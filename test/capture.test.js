@@ -5,11 +5,14 @@
 // offset. They are the tests that would have caught the reported bug on every
 // version of the code so far.
 //
-// The model they encode: the mic runs `shift` samples behind the render clock,
-// so a sound played at render frame `f` is stamped `f + shift` by the worklet.
-// The capture window opens `shift` before the boundary, so the sound of the
-// boundary sits at scratch index 0. `shift` is whatever the code computes; the
-// tests read it back from the pending record instead of assuming a value.
+// The model they encode. The capture window opens `shift` samples before the
+// boundary, and `shift` is the whole round trip: the player hears the transport
+// `outputLatency` late and therefore plays that much late, and the mic stamps
+// the sound `inputLatency` later again. So the audio of a note the player meant
+// for render frame `f` is stamped at `f + 2 * shift`, and the window -- which
+// opens at `boundary - shift` -- holds it at scratch index `shift`. `shift` is
+// whatever the code computes; the tests read it back from the pending record
+// instead of assuming a value.
 
 const assert = require("assert");
 const { load, boot, makeCanvasContext } = require("./harness");
@@ -33,6 +36,13 @@ async function armedTake(opts) {
   const length = o.length || LENGTH;
   t.armTake(ch, startTime, length);
   return { t, ch, rec: t.pendingRecord, startTime, length };
+}
+
+// The mic frame the worklet stamps a sound the player produced for render frame
+// `f`. The player hears the transport `shift` late and plays that much late; the
+// mic then stamps the result `shift` later again.
+function playedAt(rec, f) {
+  return f + 2 * rec.shift;
 }
 
 // Feeds one block of silence, optionally with a click at a given mic frame.
@@ -103,12 +113,21 @@ tests.push({
   name: "anchor: a click on the boundary lands at scratch index 0",
   async fn() {
     const { t, rec, startTime } = await armedTake();
-    // The boundary is the render frame the take starts at. The mic delivers it
-    // `shift` samples later in render time, so it sits at mic frame
-    // boundary + shift, which is exactly startFramePredicted.
     const boundary = Math.round(startTime * RATE);
-    const clickMic = boundary + rec.shift;
-    assert.strictEqual(clickMic, rec.startFramePredicted, "harness assumption");
+    assert.strictEqual(rec.boundaryFrame, boundary, "the record lost its boundary");
+    // The window opens `shift` before the boundary, and the audio of the
+    // boundary is stamped `shift` after it, so the two meet at scratch index 0.
+    assert.strictEqual(
+      rec.startFramePredicted,
+      boundary - rec.shift,
+      "the window does not open a shift before the boundary"
+    );
+    const clickMic = playedAt(rec, boundary);
+    assert.strictEqual(
+      clickMic,
+      rec.startFramePredicted + rec.shift,
+      "the boundary's audio is not a shift into the window"
+    );
     // The block carrying the click is the one that opens the window, so the
     // feed has to start there: a click the worklet never delivers is not a
     // test of where the take is anchored.
@@ -122,18 +141,28 @@ tests.push({
 // 3.3.2 — the tail survives. The block that reaches the end of the window must
 // not cut the last wanted sample, and the take must not finish before the block
 // carrying it has been written.
+//
+// The take closes at `stopFrame`, which is the end of the window, slack
+// included. A feed that stops at the end of the wanted samples never reaches it,
+// so the take would stay open and the assertions below would be reading a
+// buffer that was never committed. Feed to the stop frame.
+//
+// The click goes a seam before the end of the take, not at the very last
+// sample: foldSeam crossfades the seam tail into the head, so the final
+// `seamSamples(length)` samples are deliberately not part of the loop.
 tests.push({
   name: "tail: the last wanted sample is present after the take finishes",
   async fn() {
     const { t, rec, length } = await armedTake();
     const predicted = rec.startFramePredicted;
-    const lastWanted = predicted + length - 1;
-    feedRange(t, predicted, predicted + length + 4 * BLOCK, lastWanted);
+    const seam = t.seamSamples(length);
+    const lastWanted = predicted + length - seam - 1;
+    feedRange(t, predicted, rec.stopFrame + BLOCK, lastWanted);
     const ch = t.state.channels[0];
     assert.ok(ch.buffer, "the take never finished");
     const data = ch.buffer.getChannelData(0);
     assert.strictEqual(data.length, length, "the committed buffer is not the loop length");
-    assert.strictEqual(data[length - 1], 1, "the last wanted sample was cut");
+    assert.strictEqual(data[length - seam - 1], 1, "the last wanted sample was cut");
   },
 });
 
@@ -142,11 +171,13 @@ tests.push({
   async fn() {
     const { t, rec, length } = await armedTake();
     const predicted = rec.startFramePredicted;
-    // Put a click in the final block, at the last sample of the take.
-    const lastWanted = predicted + length - 1;
-    feedRange(t, predicted, predicted + length + 8 * BLOCK, lastWanted);
+    const seam = t.seamSamples(length);
+    // A click in the final block of the take, just inside the seam.
+    const lastWanted = predicted + length - seam - 1;
+    feedRange(t, predicted, rec.stopFrame + BLOCK, lastWanted);
     const data = t.state.channels[0].buffer.getChannelData(0);
-    assert.strictEqual(data[length - 1], 1, "the tail was truncated");
+    assert.strictEqual(data.length, length, "the committed buffer is not the loop length");
+    assert.strictEqual(data[length - seam - 1], 1, "the tail was truncated");
   },
 });
 
@@ -163,9 +194,10 @@ tests.push({
     // the live take once it is recording.
     ch.state = "recording";
     const predicted = rec.startFramePredicted;
-    // A click a quarter of the way into the take. The feed stops short of the
-    // end so the take is still open when the waveform is drawn.
-    const clickMic = predicted + Math.floor(length / 4);
+    // A click a quarter of the way into the take, as the player meant it. The
+    // feed stops short of the end so the take is still open when the waveform
+    // is drawn.
+    const clickMic = playedAt(rec, rec.boundaryFrame + Math.floor(length / 4));
     feedRange(t, predicted, predicted + length - 4 * BLOCK, clickMic);
 
     const data = t.pendingRecord.scratch;
@@ -173,7 +205,12 @@ tests.push({
     for (let i = 0; i < data.length; i++) {
       if (Math.abs(data[i]) > Math.abs(data[peak])) peak = i;
     }
-    const audioFrac = peak / length;
+    // The take starts at scratch index `shift`, so the position of the peak
+    // within the take is measured from there. The take is `lengthSamples` long,
+    // which is the loop plus its seam tail, not the loop: the canvas spans the
+    // take, so the fraction has to be taken against the same length.
+    const take = rec.lengthSamples;
+    const audioFrac = (peak - rec.shift) / take;
 
     // Redraw the live waveform from the envelope the capture built, with the
     // take still open so drawWave takes the recording branch.
@@ -184,14 +221,53 @@ tests.push({
     canvas.getContext = () => g;
     t.drawWave(ch, canvas);
 
-    const rect = g.rects.find((r) => r.w > 0 && r.h > 0);
+    // The tallest rect is the click's bucket; the short wide one is the
+    // progress bar along the bottom.
+    const rect = g.rects.filter((r) => r.w > 0 && r.h > 0).sort((a, b) => b.h - a.h)[0];
     assert.ok(rect, "the display drew nothing");
     const displayFrac = (rect.x + rect.w / 2) / canvas.clientWidth;
 
+    // The envelope is a fixed grid over the whole scratch buffer, so a bucket
+    // is `scratch.length / WAVE_BUCKETS` samples wide and the click lands
+    // somewhere inside its bucket. Half a bucket of slack is the resolution of
+    // the display, not an error in it.
+    const bucketFrac = data.length / t.liveEnv.length / take;
     assert.ok(
-      Math.abs(displayFrac - audioFrac) < 0.02,
+      Math.abs(displayFrac - audioFrac) < bucketFrac,
       `display says ${displayFrac.toFixed(3)} of the width, audio says ${audioFrac.toFixed(3)}`
     );
+  },
+});
+
+// The shift is the whole round trip, and a measured one wins over the estimate.
+// The estimate cannot see buffering the browser does not report -- a phone used
+// as a mic over ADB adds ~200 ms that no API exposes -- so a stored measurement
+// is the only way the phone and the USB mic can both land on the boundary.
+tests.push({
+  name: "shift: a stored measurement replaces the estimate",
+  async fn() {
+    const t = load({ sampleRate: RATE });
+    // Seed the per-device store before boot, the way a calibration would.
+    t.__sandbox.localStorage.setItem(
+      "loupeur.offset.v1",
+      JSON.stringify({ "": 0.24 })
+    );
+    await boot(t);
+    t.state.mode = "tempo";
+    t.state.bpm = 100;
+    t.state.bars = 1;
+    t.state.loopLength = LENGTH;
+    const ch = t.state.channels[0];
+    t.armTake(ch, 1, LENGTH);
+    const rec = t.pendingRecord;
+    assert.strictEqual(
+      rec.shift,
+      Math.round(0.24 * RATE),
+      "the stored round trip did not replace the estimate"
+    );
+    // The window still opens a shift before the boundary, so the audio of the
+    // boundary lands at scratch index 0 whatever the number is.
+    assert.strictEqual(rec.startFramePredicted, rec.boundaryFrame - rec.shift);
   },
 });
 

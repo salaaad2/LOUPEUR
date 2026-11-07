@@ -205,6 +205,19 @@ function makeCanvasContext() {
   };
 }
 
+// The slice of localStorage the app uses. Kept in memory so a test can seed a
+// stored offset and read back what the app wrote.
+function makeStorage() {
+  const map = new Map();
+  return {
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => { map.set(k, String(v)); },
+    removeItem: (k) => { map.delete(k); },
+    clear: () => map.clear(),
+    __map: map,
+  };
+}
+
 function makeDocument() {
   const byId = new Map();
   const doc = {
@@ -254,6 +267,10 @@ function load(opts) {
       },
     },
     location: { protocol: "http:" },
+    // Per-device measured offsets live here. A plain in-memory map is enough:
+    // the app only needs get/set/remove, and a test that wants a stored offset
+    // can seed it before booting.
+    localStorage: makeStorage(),
     AudioWorkletNode: function () {
       return { port: { onmessage: null }, connect() {}, disconnect() {} };
     },

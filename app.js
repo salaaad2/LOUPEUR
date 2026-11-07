@@ -18,6 +18,11 @@ const MIN_LOOP_SECONDS = 0.5;
 const MAX_TAKE_SECONDS = 8 * 60;
 const FREE_TOLERANCE = 0.05;     // seconds a later Free Mode take may miss L by
 const LATENCY_MARGIN = 0.005;    // covers the worklet's 128-sample block
+// Extra samples at the end of a capture window. The window is exactly the take
+// length, so without slack the block that carries the last wanted sample is
+// also the block that fills the buffer, and any rounding or late delivery cuts
+// the tail. One worklet block would do; 4096 is a safe first experiment.
+const CAPTURE_SLACK = 4096;
 
 // UI
 const CLEAR_HOLD_MS = 600;
@@ -54,6 +59,8 @@ let micStream = null;
 let captureNode = null;
 let captureReady = false;
 let inputLatency = 0;        // seconds, mic buffer; see measureInputLatency
+let outputLatency = 0;       // seconds, speaker buffer; see measureOutputLatency
+let deviceOffset = 0;        // seconds, measured round trip; see captureShift
 let schedulerTimer = null;
 let armTimer = null;         // promotes an armed take at its loop boundary
 let nextBoundaryIndex = 0;   // next loop index to schedule
@@ -197,6 +204,12 @@ async function ensureMic() {
     source.connect(captureNode);
     captureReady = true;
     inputLatency = measureInputLatency();
+    outputLatency = measureOutputLatency();
+    // The measured offset belongs to the device, so it is re-read on every mic
+    // open. Reading it once at boot would keep the previous device's number
+    // after a switch, with nothing in the UI saying so.
+    deviceOffset = deviceOffsetFor(state.micId);
+    logCaptureShift();
     // Labels are only readable once a stream has been granted, so the picker
     // is filled here rather than at boot.
     refreshMicList();
@@ -246,6 +259,87 @@ function measureInputLatency() {
     Math.round(total * ctx.sampleRate)
   );
   return total;
+}
+
+// How far behind the render clock the speaker is. The player hears a click
+// `outputLatency` after the transport says it played, so they play that much
+// late and the take lands that much late. It is a guaranteed error on every
+// take and it is not part of the input path, so it is measured separately.
+function measureOutputLatency() {
+  const total = ctx.outputLatency || 0;
+  console.info(
+    "[loupeur] output latency: %s ms (%s samples)",
+    (total * 1000).toFixed(1),
+    Math.round(total * ctx.sampleRate)
+  );
+  return total;
+}
+
+// The offset a take is displaced by, in seconds: how far the audio of a sound
+// the player meant for a given render frame is stamped from that frame.
+//
+// A measured round trip wins over the estimate, because the estimate cannot see
+// buffering the browser does not report -- a phone used as a mic over ADB, a
+// Bluetooth bridge, a virtual loopback. Those add tens to hundreds of
+// milliseconds that no API exposes, and they are the reason the two tracks in
+// the bug report were audibly apart.
+//
+// The estimate is the sum of the two reported buffers plus the worklet margin.
+// It is a lower bound, and it is what the app used before calibration existed.
+function captureShift() {
+  const measured = deviceOffsetFor(state.micId);
+  if (measured > 0) return measured;
+  return inputLatency + outputLatency;
+}
+
+// Measured round trips, keyed by deviceId. Per device, because the offset
+// belongs to the interface and not to the app: a value dialled in for the phone
+// must not silently apply to the USB mic.
+const OFFSET_KEY = "loupeur.offset.v1";
+
+function loadOffsets() {
+  try {
+    const raw = localStorage.getItem(OFFSET_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function deviceOffsetFor(deviceId) {
+  const value = loadOffsets()[deviceId || ""];
+  return typeof value === "number" && value > 0 ? value : 0;
+}
+
+function storeDeviceOffset(deviceId, seconds) {
+  const offsets = loadOffsets();
+  if (seconds > 0) offsets[deviceId || ""] = seconds;
+  else delete offsets[deviceId || ""];
+  try {
+    localStorage.setItem(OFFSET_KEY, JSON.stringify(offsets));
+  } catch (_) {
+    // Private mode or a full quota: the measurement still applies to this
+    // session, it just will not survive a reload.
+  }
+}
+
+// The shift is invisible otherwise, and a wrong shift is indistinguishable from
+// a wrong measurement without it. Logged once per mic open, not per take.
+function logCaptureShift() {
+  const measured = deviceOffsetFor(state.micId);
+  console.info(
+    "[loupeur] capture shift: %s ms (%s samples), %s",
+    (captureShift() * 1000).toFixed(1),
+    Math.round(captureShift() * ctx.sampleRate),
+    measured > 0
+      ? "measured round trip"
+      : "estimate: input " +
+        (inputLatency * 1000).toFixed(1) +
+        " ms + output " +
+        (outputLatency * 1000).toFixed(1) +
+        " ms"
+  );
 }
 
 // Processing is off so the take is the raw signal. deviceId is only pinned
@@ -337,6 +431,8 @@ function releaseMic() {
   }
   captureReady = false;
   inputLatency = 0;
+  outputLatency = 0;
+  deviceOffset = 0;
 }
 
 function onCaptureFrame(e) {
@@ -360,12 +456,24 @@ function onCaptureFrame(e) {
     if (frame + data.length <= rec.startFramePredicted) return;
     rec.startFrame = rec.startFramePredicted;
     if (rec.endFrame !== Infinity) rec.endFrame = rec.startFrame + rec.lengthSamples;
+    if (rec.stopFrame !== Infinity) rec.stopFrame = rec.endFrame + CAPTURE_SLACK;
   }
 
   const start = rec.startFrame;
   const end = rec.endFrame;
+  const blockEnd = frame + data.length;
   const from = Math.max(frame, start);
-  const to = Math.min(frame + data.length, end);
+  const to = Math.min(blockEnd, end);
+  // The take closes at the end of the window, not at the end of the wanted
+  // samples: the block that carries the last wanted sample has to be written
+  // before the take is committed, or the tail is cut by however much of that
+  // block lies past `end`. This is tested against the block's own end, not the
+  // clamped `to`: past `end` every block clamps to the same value, so a check
+  // on `to` can never fire and the take would never close.
+  if (blockEnd >= rec.stopFrame) {
+    finishCapture();
+    return;
+  }
   if (to <= from) return;
 
   const offset = from - frame;
@@ -395,8 +503,6 @@ function onCaptureFrame(e) {
     }
     liveEnv[b] = peak;
   }
-
-  if (to >= end) finishCapture();
 }
 // ---------------------------------------------------------------------------
 // Transport
@@ -697,13 +803,19 @@ function armTake(ch, startAt, length) {
 }
 
 function armCapture(ch, startTime, endTime, lengthSamples) {
-  const cap = lengthSamples || Math.ceil(ctx.sampleRate * MAX_TAKE_SECONDS);
-  // The mic runs `inputLatency` behind the render clock, so the samples that
-  // belong at `startTime` are stamped that much earlier. Shifting the whole
-  // window back by it puts the take where the user played it instead of
-  // `inputLatency` late. The window keeps its length, so the loop length and
-  // the seam fold are unaffected.
-  const shift = Math.round(inputLatency * ctx.sampleRate);
+  const take = lengthSamples || Math.ceil(ctx.sampleRate * MAX_TAKE_SECONDS);
+  // The window is the take plus slack. Without the slack the last wanted sample
+  // sits at the final element of the buffer, so the block that carries it is
+  // also the block that fills the buffer and any rounding or late delivery cuts
+  // the tail. The slack is never part of the take: finishCapture slices it off.
+  const cap = take + CAPTURE_SLACK;
+  // The mic runs `shift` behind the render clock, so the samples that belong at
+  // `startTime` are stamped that much earlier. Shifting the whole window back by
+  // it puts the take where the user played it instead of `shift` late. The
+  // window keeps its length, so the loop length and the seam fold are
+  // unaffected. `shift` is a measured round trip when one exists, and the sum of
+  // the reported buffers otherwise; see captureShift.
+  const shift = Math.round(captureShift() * ctx.sampleRate);
   pendingRecord = {
     channel: ch,
     // Resolved from the first captured block; see onCaptureFrame.
@@ -715,8 +827,18 @@ function armCapture(ch, startTime, endTime, lengthSamples) {
     // `shift` before the boundary, so scratch index 0 is NOT the boundary: the
     // waveform subtracts it to put the take at the left edge.
     shift,
+    // Render frame the take belongs at. The window opens `shift` before it, so
+    // the audio of the boundary is stamped here and lands at scratch index 0.
+    boundaryFrame: Math.round(startTime * ctx.sampleRate),
     lastFrame: null,
+    // Last scratch index the take wants. The write bound: samples past it are
+    // the slack and are dropped.
     endFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) - shift,
+    // Frame the take finishes at. It is the end of the window, slack included,
+    // so the block carrying the last wanted sample has been written before the
+    // take closes. Finishing on endFrame instead cut the tail by however much of
+    // that block lay past it.
+    stopFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) - shift + CAPTURE_SLACK,
     lengthSamples: lengthSamples || 0,
     scratch: new Float32Array(cap),
     // True only for the first Free Mode take, which defines the loop length
@@ -750,15 +872,21 @@ function finishCapture() {
   };
 
   let length;
+  // How many samples of the window belong to the take. The window is the take
+  // plus CAPTURE_SLACK, so this is the only number that says where the take
+  // ends; the length, the Free Mode validation and the slice all use it instead
+  // of each re-deriving it from the frames.
+  let take;
   if (rec.definesLoop) {
     // The take ends where the user punched out, not where the buffer ends.
     // Both ends are in mic frames, so the latency cancels out of the length; it
     // only moves where the loop sits on the transport clock.
     const start = rec.startFrame === null ? Math.round(ctx.currentTime * rate) : rec.startFrame;
     const recorded = rec.endFrame === Infinity
-      ? Math.round(ctx.currentTime * rate) - Math.round(inputLatency * rate) - start
+      ? Math.round(ctx.currentTime * rate) - Math.round(captureShift() * rate) - start
       : rec.endFrame - start;
-    length = Math.max(1, Math.min(recorded, rec.scratch.length));
+    take = Math.max(1, Math.min(recorded, rec.scratch.length));
+    length = take;
     if (length / rate < MIN_LOOP_SECONDS) {
       return reject("Take too short. Record at least half a second.");
     }
@@ -769,6 +897,7 @@ function finishCapture() {
     state.t0 = start / rate;
   } else {
     length = state.loopLength;
+    take = Math.min(rec.scratch.length, length + seamSamples(length));
 
     // A later Free Mode take must match the existing loop. The capture window is
     // already L + seam samples, so a take that ended early means the user
@@ -784,7 +913,7 @@ function finishCapture() {
   }
 
   if (rec.overdub) {
-    commitOverdub(ch, rec.scratch);
+    commitOverdub(ch, rec.scratch, take);
     ch.state = "playing";
     // The running source still plays the pre-overdub buffer; retire it so the
     // new one, with the added layer, is entered at the current loop position.
@@ -800,10 +929,7 @@ function finishCapture() {
   // In Tempo Lock the capture holds L + seam samples, so fold all of it back to
   // L. In Free Mode the take is exactly what was recorded, and the fold trims
   // its own tail.
-  const captured = rec.definesLoop
-    ? length
-    : Math.min(rec.scratch.length, length + seamSamples(length));
-  const folded = foldSeam(rec.scratch.subarray(0, captured));
+  const folded = foldSeam(rec.scratch.subarray(0, take));
   const buf = ctx.createBuffer(1, folded.length, rate);
   buf.getChannelData(0).set(folded);
 
@@ -921,12 +1047,16 @@ function beginOverdub(ch) {
   render();
 }
 
-function commitOverdub(ch, scratch) {
+function commitOverdub(ch, scratch, take) {
   const old = ch.buffer;
   const buf = ctx.createBuffer(1, old.length, old.sampleRate);
   const data = buf.getChannelData(0);
   data.set(old.getChannelData(0));
-  const add = scratch.subarray(0, old.length);
+  // The take starts at scratch index 0, which is the loop boundary: the window
+  // was opened `shift` before it and the anchor is the prediction, so the layer
+  // lines up with the buffer it is added to. `take` is the loop length, not the
+  // whole window, so the slack is not folded in.
+  const add = scratch.subarray(0, Math.min(take, old.length));
   for (let i = 0; i < add.length; i++) data[i] += add[i];
   ch.buffer = buf;
   ch.layers++;
@@ -1214,7 +1344,20 @@ function drawWave(ch, canvas) {
     const span = rec.scratch.length;
     const total = rec.lengthSamples || Math.ceil(ctx.sampleRate * MAX_TAKE_SECONDS);
     if (rec.lengthSamples) {
-      drawEnvelopeTimeline(g, liveEnv, span, rec.shift, rec.lengthSamples, cssW, cssH, mid, color);
+      // The envelope is a grid over the whole scratch buffer, so bucket i sits
+      // at scratch index i * per. The audio is written at `micFrame -
+      // startFrame`, so the display has to use the same origin: `origin` is the
+      // scratch index the take starts at, which is 0 once the anchor is
+      // resolved and `shift` before that. Subtracting `rec.shift` instead put
+      // the wave `shift` samples to the left of the audio whenever the anchor
+      // was not the prediction.
+      //
+      // The canvas spans the take, not the window: the window carries
+      // CAPTURE_SLACK samples past the end of the take, and drawing those would
+      // squeeze the take into the left of the picture.
+      const per = span / liveEnv.length;
+      const origin = rec.startFrame === null ? rec.shift : 0;
+      drawEnvelopeTimeline(g, liveEnv, per, origin, rec.lengthSamples, cssW, cssH, mid, color);
     } else {
       const used = Math.max(1, Math.ceil((filled / span) * liveEnv.length));
       drawEnvelope(g, liveEnv.subarray(0, used), cssW, cssH, mid, color);
@@ -1274,22 +1417,23 @@ function drawEnvelope(g, env, cssW, cssH, mid, color) {
   }
 }
 
-// Draws a live envelope as a timeline: the canvas spans `length` samples of the
-// take, so a bucket sits at the position of the audio it holds and the region
-// not yet captured stays empty.
+// Draws a take of known length as a timeline: the canvas spans `length` samples
+// of the take, so a bucket sits at the position of the audio it holds and the
+// region not yet captured stays empty.
 //
 // `env` is a grid over the whole scratch buffer, which starts `shift` samples
-// before the take (the latency correction). Subtracting `shift` puts bucket 0
-// at the left edge instead of displacing the wave by that much.
-function drawEnvelopeTimeline(g, env, span, shift, length, cssW, cssH, mid, color) {
+// before the take (the latency correction). `per` is the number of scratch
+// samples per bucket and `origin` is the scratch index the take starts at, so a
+// bucket lands at the same x the audio would: the display and the audio share
+// one origin instead of each deriving their own.
+function drawEnvelopeTimeline(g, env, per, origin, length, cssW, cssH, mid, color) {
   if (!(length > 0) || !env.length) return;
-  const per = span / env.length;
   const scale = cssW / length;
   g.fillStyle = color;
   for (let i = 0; i < env.length; i++) {
     const amp = Math.min(1, env[i]) * (mid - 2);
     if (amp <= 0.5) continue;
-    const x = (i * per - shift) * scale;
+    const x = (i * per - origin) * scale;
     if (x >= cssW) break;
     const w = Math.max(1, per * scale - 0.5);
     g.fillRect(Math.max(0, x), mid - amp, w, amp * 2);
