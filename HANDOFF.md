@@ -158,10 +158,59 @@ calls `finishCapture()` when the window is full.
 **`frame` is the render clock, not the mic clock.** The worklet stamps each block with
 the AudioContext frame it was *processed* at, but the samples inside it were captured
 `inputLatency` earlier (the device buffer: tens of ms on a wired mic, 100–300 ms on a
-phone or Bluetooth headset). Nothing compensates for that, so a take lands late by the
-input latency and plays back that much after the click. It is a constant offset, so it
-does not drift. DESIGN.md §6 "Latency compensation" specifies the fix; it is not
-implemented. If a take sounds late, suspect the input device before the code.
+phone or Bluetooth headset). A take anchored to that stamp lands late by the input
+latency and plays back that much after the click. It is a constant offset, so it does
+not drift.
+
+**Latency compensation (implemented).** `measureInputLatency()` runs in `ensureMic()`
+and returns `MediaStreamTrack.getSettings().latency` plus `LATENCY_MARGIN` (5 ms, the
+worklet's 128-sample block), falling back to `ctx.baseLatency` when the browser does not
+report it (Safari). `armCapture` shifts the whole capture window back by that many
+frames — both `startFramePredicted` and `endFrame` — so the block that carries the sound
+of the boundary is the one that opens the take. The window keeps its length, so the loop
+length, the seam fold and the Free Mode length check are untouched.
+
+Consequences worth knowing:
+
+- `startFrame` and `lastFrame` are **mic frames**, i.e. already the render time the
+  audio belongs at. `finishCapture` uses `startFrame / rate` as `t0` directly and must
+  not subtract the latency a second time.
+- The first Free Mode take's length is `end - start`, both mic frames, so the latency
+  cancels out of it. Only the punch-out path that falls back to `ctx.currentTime`
+  subtracts it explicitly.
+- The correction is applied to the *window*, not to the buffer, so nothing is rotated
+  and no audio is dropped at the head. A take still begins exactly on the boundary.
+- `inputLatency` is reset to 0 in `releaseMic()`, so a take can never be shifted by a
+  stale value from a device that is no longer open.
+
+**Measured on the user's machine (2026-11-07):** `track.latency` = 21.33 ms (1024
+samples at 48 kHz), `baseLatency` = 10.67 ms, `outputLatency` = 46–50 ms. Only the
+input side matters here: the click and the recorded audio share the render clock, so
+`outputLatency` cancels out of the looper's math. Do not add it to the correction.
+
+**The Free Mode "track 2 is shifted" bug (fixed).** A later take's capture window is
+`L + seam` long, so `finishCapture` fires `seam` samples *after* the boundary the take
+began on. `finishCapture` used to enter the new buffer via `schedulePending()`, which
+starts it at `loopOffset(ch, now)` — the loop position at that moment, i.e. `seam`
+samples into the buffer. The take then played `seam` late, permanently, because the
+buffer is `L` long while the transport's loop is `L + seam` and the error never
+cancels. Track 1 never showed it: its `t0` is back-dated to its own start frame, so
+its offset came out to 0.
+
+The fix: a later take is entered at its own start boundary with offset 0 —
+`scheduleChannel(ch, rec.startTime, 0)` — not at "now". The first Free Mode take still
+goes through `schedulePending()`, because it defines `t0` itself and has no boundary to
+wait for.
+
+Two related corrections landed with it:
+
+- `loopOffset` takes its modulo against `ch.buffer.length`, not `loopSamples()`. The
+  two differ by the seam in Free Mode, and the buffer length is the only length the
+  source actually loops on.
+- The playhead in `drawWave` measures against `ch.buffer.length` for the same reason.
+
+**Do not reintroduce `schedulePending()` for a later take.** It looks equivalent and is
+not: it is the whole bug.
 
 ### 3.5 Channel states
 

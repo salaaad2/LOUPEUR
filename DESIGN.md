@@ -155,7 +155,7 @@ Simplest workable model: **one buffer per channel, replaced at the loop boundary
 - 100% client-side; no accounts, no upload, no backend, no analytics beyond optional page-view.
 - No dependencies required; vanilla JS + Web Audio API.
 - `AudioContext` is created on the first user gesture and resumed if suspended (required by Safari).
-- **Latency compensation:** subtract the round-trip latency `inputLatency + outputLatency` from the recorded start when aligning a take to the transport. `inputLatency` comes from the `MediaStreamTrack` settings where available; `outputLatency` is not implemented in Safari, so fall back to `baseLatency` there. If neither is available, use 0 and expose a manual offset in the UI (advanced, default 0).
+- **Latency compensation:** the capture window is shifted back by the input latency, so a take lands where the user played it instead of `inputLatency` late. `inputLatency` comes from the `MediaStreamTrack` settings (`getSettings().latency`) plus a 5 ms margin for the worklet block; when the browser does not report it (Safari), fall back to `ctx.baseLatency`. The shift is applied to the window, not to the buffer, so the loop length, the seam fold and the boundary alignment are unchanged. There is no manual offset control yet.
 - Graceful errors: unsupported browser banner (no AudioWorklet, no getUserMedia); mic-permission-denied message with retry.
 - Desktop-first layout (~1200px content, responsive down to ~768px).
 

@@ -15,6 +15,7 @@ const MAX_TAKE_SECONDS = 8 * 60;
 const FREE_TOLERANCE = 0.05;     // seconds
 const CLEAR_HOLD_MS = 600;
 const EXPORT_TAIL = 1;           // seconds of reverb tail
+const LATENCY_MARGIN = 0.005;    // seconds, covers the worklet's 128-sample block
 
 // ---------------------------------------------------------------------------
 // State
@@ -44,6 +45,7 @@ let clickGain = null;
 let micStream = null;
 let captureNode = null;
 let captureReady = false;
+let inputLatency = 0;        // seconds, mic buffer; see measureInputLatency
 let schedulerTimer = null;
 let armTimer = null;         // promotes an armed take at its loop boundary
 let nextBoundaryIndex = 0;   // next loop index to schedule
@@ -185,6 +187,7 @@ async function ensureMic() {
     captureNode.port.onmessage = onCaptureFrame;
     source.connect(captureNode);
     captureReady = true;
+    inputLatency = measureInputLatency();
     // Labels are only readable once a stream has been granted, so the picker
     // is filled here rather than at boot.
     refreshMicList();
@@ -206,6 +209,34 @@ async function ensureMic() {
     }
     return false;
   }
+}
+
+// How far behind the render clock the mic samples are. The worklet stamps a
+// block with the frame it was processed at, but the samples inside it were
+// captured `inputLatency` earlier, so a take anchored to that stamp lands late
+// by exactly this much. `latency` is the device buffer; the margin covers the
+// block the worklet has to fill before it can post anything. Browsers that do
+// not report it (Safari) fall back to the context's own base latency.
+function measureInputLatency() {
+  let device = 0;
+  if (micStream) {
+    for (const track of micStream.getAudioTracks()) {
+      const settings = track.getSettings ? track.getSettings() : null;
+      if (settings && settings.latency > 0) device = settings.latency;
+    }
+  }
+  if (!(device > 0)) device = ctx.baseLatency || 0;
+  const total = device + LATENCY_MARGIN;
+  // The number is invisible otherwise, and every "the take is late" report
+  // needs it to be actionable. Logged once per mic open, not per take.
+  console.info(
+    "[loupeur] input latency: device %s ms + margin %s ms = %s ms (%s samples)",
+    (device * 1000).toFixed(1),
+    (LATENCY_MARGIN * 1000).toFixed(1),
+    (total * 1000).toFixed(1),
+    Math.round(total * ctx.sampleRate)
+  );
+  return total;
 }
 
 // Processing is off so the take is the raw signal. deviceId is only pinned
@@ -296,6 +327,7 @@ function releaseMic() {
     captureNode = null;
   }
   captureReady = false;
+  inputLatency = 0;
 }
 
 function onCaptureFrame(e) {
@@ -306,6 +338,8 @@ function onCaptureFrame(e) {
   // The take starts at the first block that overlaps the capture window. For
   // an armed take the window opens at a loop boundary, so blocks that arrive
   // before it are dropped and the take is anchored to the boundary itself.
+  // The window is shifted back by the input latency, so the block that
+  // carries the sound of the boundary is the one that opens the take.
   if (rec.startFrame === null) {
     if (frame + data.length <= rec.startFramePredicted) return;
     rec.startFrame = Math.max(frame, rec.startFramePredicted);
@@ -430,9 +464,16 @@ function schedulePending() {
 // Loop position, in samples, that a channel's buffer starts at when its
 // source is started at `when`, measured from the channel's anchor (its own
 // anchorTime, or the loop top).
+//
+// The modulo is taken in samples, against the buffer's own length, not against
+// loopSamples(). The two differ by the seam: a Free Mode take is folded to
+// `L - seam`, so a modulo against `L` would leave the source up to `seam`
+// samples short of the loop top and every take would enter shifted right by
+// that much. The buffer length is the only length the source actually has.
 function loopOffset(ch, when) {
   const anchor = ch.anchorTime || state.t0;
-  const L = loopSamples();
+  const L = ch.buffer ? ch.buffer.length : loopSamples();
+  if (!L) return 0;
   const elapsed = Math.round((when - anchor) * ctx.sampleRate);
   return ((elapsed % L) + L) % L;
 }
@@ -610,15 +651,21 @@ async function beginRecord(ch) {
 
 function armCapture(ch, startTime, endTime, lengthSamples) {
   const cap = lengthSamples || Math.ceil(ctx.sampleRate * MAX_TAKE_SECONDS);
+  // The mic runs `inputLatency` behind the render clock, so the samples that
+  // belong at `startTime` are stamped that much earlier. Shifting the whole
+  // window back by it puts the take where the user played it instead of
+  // `inputLatency` late. The window keeps its length, so the loop length and
+  // the seam fold are unaffected.
+  const shift = Math.round(inputLatency * ctx.sampleRate);
   pendingRecord = {
     channel: ch,
     // Resolved from the first captured block; see onCaptureFrame.
     startFrame: null,
     // Frame the capture window opens at. Blocks before it are discarded, so
     // an armed take begins exactly at the loop boundary.
-    startFramePredicted: Math.round(startTime * ctx.sampleRate),
+    startFramePredicted: Math.round(startTime * ctx.sampleRate) - shift,
     lastFrame: null,
-    endFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate),
+    endFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) - shift,
     lengthSamples: lengthSamples || 0,
     scratch: new Float32Array(cap),
     freeMode: state.mode === "free" && !state.loopLength,
@@ -646,9 +693,11 @@ function finishCapture() {
   let length;
   if (rec.freeMode) {
     // The take ends where the user punched out, not where the buffer ends.
+    // Both ends are in mic frames, so the latency cancels out of the length;
+    // it only moves where the loop sits on the transport clock.
     const start = rec.startFrame === null ? Math.round(ctx.currentTime * rate) : rec.startFrame;
     const recorded = rec.endFrame === Infinity
-      ? Math.round(ctx.currentTime * rate) - start
+      ? Math.round(ctx.currentTime * rate) - Math.round(inputLatency * rate) - start
       : rec.endFrame - start;
     length = Math.max(1, Math.min(recorded, rec.scratch.length));
     if (length / rate < MIN_LOOP_SECONDS) {
@@ -658,6 +707,9 @@ function finishCapture() {
       return;
     }
     state.loopLength = length;
+    // startFrame is a mic frame, so it is already the render time the take
+    // belongs at: the latency correction is baked into the window, not
+    // applied again here.
     state.t0 = start / rate;
   } else {
     length = state.loopLength;
@@ -715,14 +767,27 @@ function finishCapture() {
   ch.buffer = buf;
   ch.layers = 1;
   ch.state = "playing";
-  // Loop position the buffer starts at. A take recorded from the loop top is
-  // anchored to t0; the first Free Mode take is anchored to the frame capture
-  // actually began at, which is mid-loop, so playback enters it at the
-  // position the transport has already reached.
-  ch.anchorTime = rec.freeMode ? state.t0 : null;
+  // Loop position the buffer starts at. Every take is anchored to the loop
+  // top: a later take is captured from the boundary, and the first Free Mode
+  // take defines t0 as the frame its own capture began at, so its buffer
+  // starts at loop sample 0 too. Anchoring it to t0 is what keeps it in phase
+  // with the tracks recorded after it.
+  ch.anchorTime = null;
   // Enter the take at the loop position the transport has reached, instead of
   // waiting for the next boundary, which is a whole loop away.
-  schedulePending();
+  //
+  // A later take is entered at its own start boundary, not at "now". Its
+  // capture window is L + seam long, so finishCapture fires seam samples after
+  // the boundary it began on; entering at "now" would start the buffer seam
+  // samples into itself and play the whole take late by that much. The buffer
+  // is L long and the transport's loop is L + seam, so the error never
+  // cancels. The first Free Mode take has no boundary to wait for: it defines
+  // t0 itself and is entered immediately.
+  if (rec.freeMode) {
+    schedulePending();
+  } else {
+    scheduleChannel(ch, rec.startTime, 0);
+  }
   render();
 }
 
@@ -758,7 +823,8 @@ function punchOut(ch) {
     if (pendingRecord.freeMode) {
       // First take: the length is whatever was captured up to now. The worklet
       // delivers blocks asynchronously, so the take ends at the last frame we
-      // actually received, not at the wall clock.
+      // actually received, not at the wall clock. That frame is a mic frame,
+      // so it is already latency-corrected like the start.
       const rec = pendingRecord;
       if (rec.startFrame === null) {
         finishCapture();
@@ -1122,9 +1188,10 @@ function drawWave(ch, canvas) {
     }
   }
 
-  // Playhead during playback.
-  if (state.transport === "running" && state.loopLength && ch.buffer) {
-    const L = state.loopLength / ctx.sampleRate;
+  // Playhead during playback. Measured against the buffer's own length, the
+  // same length the source loops on, so it sits where the audio actually is.
+  if (state.transport === "running" && ch.buffer) {
+    const L = ch.buffer.length / ctx.sampleRate;
     const pos = (((ctx.currentTime - state.t0) % L) + L) % L / L;
     g.strokeStyle = "rgba(255,255,255,0.55)";
     g.lineWidth = 1;
