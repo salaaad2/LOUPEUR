@@ -61,33 +61,67 @@ and re-enters it at the wrong offset. `scheduleChannel` clears `ch.source` in
 ## Capture is anchored to a predicted frame, not the first block
 
 `armCapture` stores `startFramePredicted = round(startTime × sampleRate)`, shifted
-back by the input latency. `onCaptureFrame` drops blocks that end at or before
-it, and the take is anchored to `startFramePredicted` itself.
+back by the capture shift. `onCaptureFrame` drops blocks that end at or before
+it, and the take is anchored to `startFramePredicted` itself:
 
-**Known defect, do not preserve it.** The code currently resolves the anchor as
-`startFrame = max(frame, startFramePredicted)`. The worklet delivers blocks on
-its own schedule, so the first block that overlaps the window almost always
-starts *after* the prediction; `max()` then picks that block and the latency
-correction is silently discarded. `endFrame` is recomputed from the wrong
-anchor, so the whole window slides with it. This is why every manual offset
-tried so far had no audible effect. The anchor must be the prediction, and the
-samples between the prediction and the first block must stay zero. See
-`ISSUE.md` 2.4a.
+```js
+rec.startFrame = rec.startFramePredicted;
+```
+
+The worklet delivers blocks on its own schedule, so the first block that
+overlaps the window almost always starts *after* the prediction. Anchoring to
+that block instead would discard the latency correction and slide the whole
+take, and `endFrame` with it. The samples between the prediction and the first
+block stay zero, which is correct: they are the pre-boundary audio the window
+was opened for.
 
 The worklet stamps a block with the render frame it was processed at, but the
-samples inside it were captured `inputLatency` earlier. The window is shifted
-back by that much so the take lands where it was played. The shift is applied to
-the **window**, not the buffer, so the loop length, the seam fold and the
-boundary alignment are untouched. `startFrame` and `lastFrame` are therefore
-already mic frames: do not subtract the latency a second time.
+samples inside it were captured earlier. The window is shifted back by that much
+so the take lands where it was played. The shift is applied to the **window**,
+not the buffer, so the loop length, the seam fold and the boundary alignment are
+untouched. `startFrame` and `lastFrame` are therefore already mic frames: do not
+subtract the latency a second time.
 
 **Both sides matter.** An earlier version of this file claimed `outputLatency`
 cancels out because the click and the recorded audio share the render clock.
 That is wrong. The click is *scheduled* on the render clock but *heard*
 `outputLatency` later, so the player plays `outputLatency` late, and the take
-lands that much late. `outputLatency` is not read anywhere in `app.js` today,
-which is a guaranteed device-independent error on every take. See `ISSUE.md`
-2.3.
+lands that much late. `captureShift()` is the one place that number comes from:
+
+```js
+function captureShift() {
+  const measured = deviceOffsetFor(state.micId);
+  if (measured > 0) return measured;      // a calibration, per device
+  return inputLatency + outputLatency;    // the reported buffers
+}
+```
+
+A measured round trip wins over the estimate, because the estimate cannot see
+buffering the browser does not report: a phone used as a mic over ADB, a
+Bluetooth bridge, a virtual loopback. Those add tens to hundreds of
+milliseconds that no API exposes. The estimate is a lower bound.
+
+## The window is the take plus slack
+
+`cap = take + CAPTURE_SLACK`. Without the slack the last wanted sample sits at
+the final element of the buffer, so the block that carries it is also the block
+that fills the buffer, and any rounding or late delivery cuts the tail.
+
+The take closes at `stopFrame`, the end of the window, not at `endFrame`, the
+end of the wanted samples. The block carrying the last wanted sample has to be
+written before the take commits. The check is against the block's own end:
+
+```js
+const blockEnd = frame + data.length;
+if (blockEnd >= rec.stopFrame) { finishCapture(); return; }
+```
+
+Testing the clamped write bound instead (`to = min(blockEnd, endFrame)`) can
+never fire: past `endFrame` every block clamps to the same value, so the take
+never closes at all. That was a real bug, caught by the tail tests.
+
+`take` is computed once in `finishCapture` and used by the length, the Free Mode
+validation and the slice. It is not re-derived from the frames at each site.
 
 ## ARMED is driven by the clock, not by audio
 
@@ -100,17 +134,25 @@ late and make the state invisible.
 ## A take of known length is drawn as a timeline
 
 When `rec.lengthSamples` is set (Tempo Lock, overdub), `drawEnvelopeTimeline`
-maps the canvas to the take length: bucket `b` sits at `(b * per - shift) / length`
+maps the canvas to the take length: bucket `b` sits at `(b * per - origin) / length`
 of the width, so the wave grows left to right and the part not yet recorded
-stays empty. `shift` is subtracted because the scratch buffer opens that many
-samples before the take.
+stays empty.
 
-`shift` is the *predicted* head, not the resolved one. The audio is written at
-`from - rec.startFrame`, so the display and the audio share an origin only when
-`rec.startFrame === rec.startFramePredicted` — which, per the anchor defect
-above, is the case that does not happen. The waveform therefore disagrees with
-the audio by exactly the amount the anchor moved. Both must be derived from one
-value; see `ISSUE.md` 2.6.
+`origin` is the **scratch index** the take starts at, not a mic frame: `0` once
+the anchor is resolved, `shift` before that. The audio is written at
+`micFrame - rec.startFrame`, so the display and the audio share one origin. An
+earlier version passed `rec.shift` and multiplied it by the take scale, mixing
+two frame spaces; the waveform then disagreed with the audio by exactly the
+amount the anchor moved.
+
+The canvas spans the take, not the window. The window carries `CAPTURE_SLACK`
+samples past the end of the take, and drawing those would squeeze the take into
+the left of the picture.
+
+The envelope is a fixed grid over the whole scratch buffer, so a bucket is
+`scratch.length / WAVE_BUCKETS` samples wide and a sample lands somewhere inside
+its bucket. That bucket width is the resolution of the display; the display test
+allows half a bucket, not an absolute tolerance.
 
 Stretching the captured fraction to full width instead re-scaled the whole
 picture on every block, which read as peaks arriving from the right and

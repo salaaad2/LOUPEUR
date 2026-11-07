@@ -70,11 +70,28 @@ and an overdub both run to the end of the loop on their own. The button shows
 
 ## Testing
 
-There is no test suite in the repo. The audio math (loop length, seam fold,
-boundary and offset arithmetic, envelope) is pure and can be exercised in Node
-against a stubbed Web Audio API; that is how the current behaviour was checked.
-Anything involving real capture, scheduling or rendering needs a browser and a
-microphone.
+```
+node test/run.js
+```
+
+No dependencies, no build step. `test/harness.js` loads `app.js` into a `vm`
+context with a stubbed DOM and Web Audio API and hands back the internals a test
+needs to drive capture directly, so the audio math (loop length, seam fold,
+boundary and offset arithmetic, envelope) runs in Node.
+
+The capture tests assert three properties that do not depend on knowing the true
+latency of the hardware:
+
+1. **The anchor is honoured.** Blocks that start after the prediction do not move
+   the take, and the head between the two stays zero.
+2. **The tail survives.** The last wanted sample is present after the take
+   commits, including when the take ends on a block boundary.
+3. **The display agrees with the audio.** The buffer index of a peak and the x
+   position the waveform gives that sample refer to the same fraction of the take.
+
+They assert internal consistency, not an absolute offset, which is why they hold
+on any device. Anything involving real capture, scheduling or rendering still
+needs a browser and a microphone.
 
 ## Known limitations
 
@@ -82,7 +99,10 @@ microphone.
   feedback but means you hear yourself only through the recorded loop.
 - An overdub becomes audible one loop boundary after you punch out, because the
   buffer is replaced at the boundary rather than mutated in place.
-- Latency compensation uses the device's reported input latency plus a 5 ms
-  margin. There is no manual offset control, so an unusual device may still land
-  a few milliseconds off.
+- Latency compensation is an estimate: the device's reported input latency plus
+  `outputLatency` plus a 5 ms margin. It cannot see buffering the browser does
+  not report, so a phone used as a mic over ADB or a Bluetooth bridge still lands
+  late. `captureShift()` already prefers a measured per-device round trip when
+  one is stored, but nothing in the UI writes one yet; that calibration is the
+  next step.
 - Export renders one loop plus a 1 s reverb tail, trimmed to the loop length.
