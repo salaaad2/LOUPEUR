@@ -1,14 +1,24 @@
+/* Loupeur — dark-blue neobrutalist skin.
+   index.min.css ships the neobrutalist components with hardcoded white/black
+   colours. This file loads after it and re-skins those components onto the
+   dark-blue palette: navy panels, near-black borders and offset shadows. */
+
 :root {
-  --bg: #12141a;
-  --panel: #1b1e26;
-  --panel-2: #232733;
-  --line: #2e3342;
-  --text: #e6e8ee;
-  --dim: #8b93a7;
+  --bg: #0b0f1a;
+  --panel: #16203a;
+  --panel-2: #1d2a4a;
+  --line: #05070d;
+  --text: #e6ecff;
+  --dim: #8fa2c9;
   --rec: #e5484d;
   --play: #30a46c;
   --dub: #f5a524;
   --accent: #5b8def;
+
+  --nb-border: 3px;
+  --nb-shadow: 6px 6px 0 var(--line);
+  --nb-shadow-sm: 4px 4px 0 var(--line);
+  --nb-font: "Lexend Mega", "Public Sans", system-ui, sans-serif;
 }
 
 * { box-sizing: border-box; }
@@ -21,35 +31,53 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* The banner is toggled with the `hidden` attribute. The sheet's .nb-hidden
+   uses !important, so guard the native attribute explicitly. */
+[hidden] { display: none !important; }
+
+/* --------------------------------------------------------------------------
+   Header
+   -------------------------------------------------------------------------- */
+
 .header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 20px 28px;
-  border-bottom: 1px solid var(--line);
+  margin: 20px 28px 0;
+  padding: 16px 22px;
+  background: var(--panel);
+  border: var(--nb-border) solid var(--line);
+  box-shadow: var(--nb-shadow);
 }
 
 .header h1 {
   margin: 0;
-  font-size: 19px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-}
-
-.header .sub {
-  color: var(--dim);
-  font-weight: 400;
+  font-family: var(--nb-font);
+  font-size: 22px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text);
 }
 
 .badge {
-  font-size: 12px;
-  color: var(--dim);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 4px 12px;
+  font-family: var(--nb-font);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--bg);
+  background: var(--accent);
+  border: 2px solid var(--line);
+  box-shadow: 3px 3px 0 var(--line);
+  padding: 4px 10px;
   white-space: nowrap;
 }
+
+/* --------------------------------------------------------------------------
+   Layout
+   -------------------------------------------------------------------------- */
 
 .wrap {
   max-width: 1200px;
@@ -57,21 +85,33 @@ body {
   padding: 24px 28px 64px;
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  align-items: stretch;
+  gap: 22px;
 }
 
+/* Panels are .nb-card, which is a column flex container. Override its white
+   fill, hover lift and stacking direction. flex:1 + min-width:0 makes the
+   panel fill the column instead of shrink-to-fitting its row of controls. */
 .panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: none;
   background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 16px 20px;
+  color: var(--text);
+  border: var(--nb-border) solid var(--line);
+  box-shadow: var(--nb-shadow);
+  padding: 18px 22px;
+  flex-direction: row;
 }
+
+.panel:hover { box-shadow: var(--nb-shadow); transform: none; }
 
 .controls,
 .output {
   display: flex;
+  flex-direction: row;
   align-items: flex-end;
-  gap: 28px;
+  gap: 26px;
   flex-wrap: wrap;
 }
 
@@ -84,8 +124,12 @@ body {
 
 .control.grow { flex: 1; }
 
-.control label {
-  font-size: 12px;
+/* .nb-label is black-on-white by default. */
+.control label,
+.nb-label {
+  font-family: var(--nb-font);
+  font-size: 11px;
+  font-weight: 900;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--dim);
@@ -96,41 +140,73 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* --------------------------------------------------------------------------
+   Range sliders
+   -------------------------------------------------------------------------- */
+
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
   width: 100%;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--line);
+  height: 10px;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  background: var(--panel-2);
+  box-shadow: 3px 3px 0 var(--line);
   outline: none;
 }
 
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--text);
+  width: 18px;
+  height: 22px;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  background: var(--accent);
   cursor: pointer;
 }
 
 input[type="range"]::-moz-range-thumb {
-  width: 16px;
-  height: 16px;
-  border: 0;
-  border-radius: 50%;
-  background: var(--text);
+  width: 18px;
+  height: 22px;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  background: var(--accent);
   cursor: pointer;
 }
 
-select {
+/* --------------------------------------------------------------------------
+   Selects (.nb-dropdown)
+   -------------------------------------------------------------------------- */
+
+select,
+.nb-dropdown {
   background: var(--panel-2);
   color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  box-shadow: var(--nb-shadow-sm);
   padding: 8px 10px;
-  font: inherit;
+  font-family: var(--nb-font);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+  outline: none;
+}
+
+select:focus,
+.nb-dropdown:focus {
+  transform: translate(2px, 2px);
+  box-shadow: 2px 2px 0 var(--line);
+}
+
+select option,
+.nb-dropdown option {
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: system-ui, sans-serif;
+  font-weight: 400;
+  text-transform: none;
 }
 
 /* Device labels are long ("Headset Microphone (Bluetooth)"), so the picker
@@ -142,91 +218,103 @@ select {
   white-space: nowrap;
 }
 
+/* --------------------------------------------------------------------------
+   Mode toggle (.nb-button pair)
+   -------------------------------------------------------------------------- */
+
 .segmented {
   display: inline-flex;
+  gap: 8px;
+}
+
+.segmented .nb-button {
+  padding: 8px 14px;
+  font-size: 11px;
   background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 3px;
-  gap: 3px;
-}
-
-.segmented button {
-  background: none;
-  border: 0;
   color: var(--dim);
-  font: inherit;
-  font-size: 13px;
-  padding: 6px 14px;
-  border-radius: 6px;
-  cursor: pointer;
+  border: 2px solid var(--line);
+  box-shadow: var(--nb-shadow-sm);
 }
 
-.segmented button.on {
+.segmented .nb-button:hover,
+.segmented .nb-button:focus {
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 2px 2px 0 var(--line);
+  transform: translate(2px, 2px);
+}
+
+.segmented .nb-button.on {
   background: var(--accent);
   color: #fff;
 }
 
-.segmented button:disabled { opacity: 0.4; cursor: not-allowed; }
+.segmented .nb-button:disabled { opacity: 0.4; cursor: not-allowed; }
 
-.switch { position: relative; display: inline-block; width: 44px; height: 24px; }
-.switch input { opacity: 0; width: 0; height: 0; }
-.switch span {
-  position: absolute;
-  inset: 0;
+/* --------------------------------------------------------------------------
+   Checkboxes (.nb-checkbox)
+   -------------------------------------------------------------------------- */
+
+input.nb-checkbox {
+  width: 26px;
+  height: 26px;
+  margin: 0;
   background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  cursor: pointer;
-  transition: background 0.15s;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  box-shadow: 3px 3px 0 var(--line);
 }
-.switch span::after {
-  content: "";
+
+input.nb-checkbox:hover {
+  transform: translate(1.5px, 1.5px);
+  box-shadow: 1.5px 1.5px 0 var(--line);
+}
+
+input.nb-checkbox:checked {
+  background: var(--accent);
+  color: #fff;
+}
+
+input.nb-checkbox:checked::before {
+  content: "\2714";
+  font-weight: bold;
+  color: #fff;
   position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--dim);
-  transition: transform 0.15s, background 0.15s;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 16px;
 }
-.switch input:checked + span { background: var(--accent); border-color: var(--accent); }
-.switch input:checked + span::after { transform: translateX(20px); background: #fff; }
+
+/* --------------------------------------------------------------------------
+   Tracks
+   -------------------------------------------------------------------------- */
 
 .tracks {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 14px;
+  gap: 18px;
 }
 
 .track {
   position: relative;
   background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 12px;
+  color: var(--text);
+  border: var(--nb-border) solid var(--line);
+  box-shadow: var(--nb-shadow);
   padding: 14px;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  transition: border-color 0.15s, background 0.15s;
+  transition: box-shadow 0.12s, transform 0.12s;
 }
 
-/* Active track: accent border, brighter panel, accent name. */
+.track:hover { box-shadow: var(--nb-shadow); transform: none; }
+
+/* Active track: accent border, accent name. */
 .track.selected {
   border-color: var(--accent);
-  background: #1f2430;
-}
-
-.track.selected::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 12px;
-  bottom: 12px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
-  background: var(--accent);
+  background: #1a2544;
 }
 
 .track.selected .track-name { color: var(--accent); }
@@ -235,9 +323,9 @@ select {
   display: block;
   width: 100%;
   height: 48px;
-  border-radius: 6px;
-  background: #14171e;
-  border: 1px solid var(--line);
+  border: 2px solid var(--line);
+  border-radius: 0;
+  background: #0d1424;
 }
 
 .track-head {
@@ -247,104 +335,176 @@ select {
 }
 
 .track-name {
-  font-size: 12px;
+  font-family: var(--nb-font);
+  font-size: 11px;
+  font-weight: 900;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--dim);
 }
 
 .layers {
-  font-size: 11px;
+  font-family: var(--nb-font);
+  font-size: 10px;
+  font-weight: 900;
   font-variant-numeric: tabular-nums;
-  color: var(--dim);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 1px 8px;
+  color: var(--bg);
+  background: var(--dim);
+  border: 2px solid var(--line);
+  padding: 0 6px;
   visibility: hidden;
 }
 
 .layers.show { visibility: visible; }
 
+/* The big per-track button. State colours come from data-state. */
 .primary {
   width: 100%;
-  min-height: 96px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
+  min-height: 92px;
+  padding: 0;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  box-shadow: var(--nb-shadow-sm);
   background: var(--panel-2);
   color: var(--text);
-  font: inherit;
-  font-size: 15px;
-  font-weight: 600;
+  font-family: var(--nb-font);
+  font-size: 14px;
+  font-weight: 900;
   letter-spacing: 0.04em;
+  text-transform: uppercase;
   cursor: pointer;
-  transition: background 0.12s, border-color 0.12s;
+  transition: background 0.12s, box-shadow 0.12s, transform 0.1s;
 }
 
-.primary:hover { border-color: var(--dim); }
+.primary:hover,
+.primary:focus {
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 2px 2px 0 var(--line);
+  transform: translate(2px, 2px);
+}
 
-.primary:disabled { cursor: default; }
-.primary:disabled:hover { border-color: var(--rec); }
+.primary:active { box-shadow: none; transform: translate(4px, 4px); }
 
-.primary[data-state="armed"] { background: var(--accent); border-color: var(--accent); color: #fff; }
-.primary[data-state="recording"] { background: var(--rec); border-color: var(--rec); color: #fff; }
-.primary[data-state="playing"] { background: var(--play); border-color: var(--play); color: #fff; }
-.primary[data-state="overdubbing"] { background: var(--dub); border-color: var(--dub); color: #1a1200; }
+.primary:disabled { cursor: default; opacity: 1; }
+.primary:disabled:hover { transform: none; box-shadow: var(--nb-shadow-sm); }
+
+.primary[data-state="armed"] { background: var(--accent); color: #fff; }
+.primary[data-state="recording"] { background: var(--rec); color: #fff; }
+.primary[data-state="playing"] { background: var(--play); color: #fff; }
+.primary[data-state="overdubbing"] { background: var(--dub); color: #1a1200; }
 
 .track-foot { display: flex; gap: 8px; }
 
 .small {
   flex: 1;
   padding: 8px 0;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: none;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  box-shadow: 3px 3px 0 var(--line);
+  background: var(--panel-2);
   color: var(--dim);
-  font: inherit;
-  font-size: 12px;
+  font-family: var(--nb-font);
+  font-size: 10px;
+  font-weight: 900;
   letter-spacing: 0.05em;
+  text-transform: uppercase;
   cursor: pointer;
   user-select: none;
   -webkit-user-select: none;
   touch-action: manipulation;
+  transition: background 0.12s, color 0.12s, box-shadow 0.1s, transform 0.1s;
 }
 
-.small:hover { color: var(--text); border-color: var(--dim); }
-.small.latched { background: var(--rec); border-color: var(--rec); color: #fff; }
-.small.holding { background: var(--rec); border-color: var(--rec); color: #fff; }
+.small:hover,
+.small:focus {
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 1px 1px 0 var(--line);
+  transform: translate(2px, 2px);
+}
+
+.small.latched,
+.small.holding {
+  background: var(--rec);
+  color: #fff;
+}
+
+/* --------------------------------------------------------------------------
+   Export
+   -------------------------------------------------------------------------- */
 
 .btn.export {
-  padding: 11px 22px;
-  border: 0;
-  border-radius: 8px;
+  padding: 12px 22px;
+  font-size: 12px;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  box-shadow: var(--nb-shadow-sm);
   background: var(--accent);
   color: #fff;
-  font: inherit;
-  font-weight: 600;
+  font-family: var(--nb-font);
+  font-weight: 900;
+  text-transform: uppercase;
   cursor: pointer;
 }
 
-.btn.export:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn.export:hover,
+.btn.export:focus {
+  background: #4a7ce0;
+  box-shadow: 2px 2px 0 var(--line);
+  transform: translate(2px, 2px);
+}
 
-.help { color: var(--dim); font-size: 13px; }
-.help p { margin: 0 0 6px; }
+.btn.export:active { box-shadow: none; transform: translate(4px, 4px); }
+
+.btn.export:disabled {
+  opacity: 1;
+  background: var(--panel-2);
+  color: var(--dim);
+  box-shadow: none;
+  transform: none;
+  cursor: not-allowed;
+}
+
+/* --------------------------------------------------------------------------
+   Help
+   -------------------------------------------------------------------------- */
+
+.help {
+  color: var(--dim);
+  font-size: 13px;
+  flex-direction: column;
+  gap: 0;
+}
+.help p { margin: 0 0 8px; }
 .help p:last-child { margin-bottom: 0; }
 
 kbd {
   background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-bottom-width: 2px;
-  border-radius: 5px;
+  border: 2px solid var(--line);
+  box-shadow: 2px 2px 0 var(--line);
+  border-radius: 0;
   padding: 1px 6px;
-  font: inherit;
-  font-size: 12px;
+  font-family: var(--nb-font);
+  font-size: 11px;
+  font-weight: 900;
   color: var(--text);
 }
+
+/* --------------------------------------------------------------------------
+   Banner
+   -------------------------------------------------------------------------- */
 
 .banner {
   background: var(--rec);
   color: #fff;
-  padding: 10px 28px;
-  font-size: 14px;
+  border-bottom: var(--nb-border) solid var(--line);
+  padding: 12px 28px;
+  font-family: var(--nb-font);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }
 
 @media (max-width: 900px) {
@@ -354,5 +514,5 @@ kbd {
 @media (max-width: 560px) {
   .tracks { grid-template-columns: 1fr; }
   .wrap { padding: 16px; }
-  .header { padding: 16px; flex-wrap: wrap; }
+  .header { margin: 16px 16px 0; padding: 14px 16px; flex-wrap: wrap; }
 }

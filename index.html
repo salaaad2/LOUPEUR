@@ -4,28 +4,29 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Loupeur</title>
+<link rel="stylesheet" href="index.min.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <div id="banner" class="banner" hidden></div>
 
-<header class="header">
-  <h1>Loupeur</h1>
+<header class="header nb-navbar">
+  <h1 class="nb-navbar-brand">Loupeur</h1>
   <span class="badge">Free Tool · No Signup</span>
 </header>
 
-<main class="wrap">
+<main class="wrap nb-container">
 
-  <section class="panel controls">
+  <section class="panel controls nb-card">
     <div class="control">
-      <label for="bpm">BPM <output id="bpmOut">100</output></label>
+      <label class="nb-label" for="bpm">BPM <output id="bpmOut">100</output></label>
       <input type="range" id="bpm" min="60" max="180" step="1" value="100">
     </div>
 
     <div class="control">
-      <label for="bars">Bars per loop</label>
-      <select id="bars">
+      <label class="nb-label" for="bars">Bars per loop</label>
+      <select id="bars" class="nb-dropdown">
         <option value="1" selected>1</option>
         <option value="2">2</option>
         <option value="4">4</option>
@@ -34,21 +35,21 @@
     </div>
 
     <div class="control">
-      <label>Mode</label>
+      <label class="nb-label">Mode</label>
       <div class="segmented" id="mode">
-        <button type="button" data-mode="tempo" class="on">Tempo Lock</button>
-        <button type="button" data-mode="free">Free</button>
+        <button type="button" data-mode="tempo" class="nb-button on">Tempo Lock</button>
+        <button type="button" data-mode="free" class="nb-button">Free</button>
       </div>
     </div>
 
     <div class="control">
-      <label for="click">Click track</label>
-      <label class="switch"><input type="checkbox" id="click" checked><span></span></label>
+      <label class="nb-label" for="click">Click track</label>
+      <input type="checkbox" id="click" class="nb-checkbox" checked>
     </div>
 
     <div class="control">
-      <label for="mic">Microphone</label>
-      <select id="mic">
+      <label class="nb-label" for="mic">Microphone</label>
+      <select id="mic" class="nb-dropdown">
         <option value="">Default input</option>
       </select>
     </div>
@@ -56,19 +57,19 @@
 
   <section class="tracks" id="tracks"></section>
 
-  <section class="panel output">
+  <section class="panel output nb-card">
     <div class="control">
-      <label for="reverb">Reverb</label>
-      <label class="switch"><input type="checkbox" id="reverb"><span></span></label>
+      <label class="nb-label" for="reverb">Reverb</label>
+      <input type="checkbox" id="reverb" class="nb-checkbox">
     </div>
     <div class="control grow">
-      <label for="master">Master <output id="masterOut">85</output></label>
+      <label class="nb-label" for="master">Master <output id="masterOut">85</output></label>
       <input type="range" id="master" min="0" max="100" step="1" value="85">
     </div>
-    <button type="button" id="export" class="btn export">Export Mix</button>
+    <button type="button" id="export" class="nb-button orange export">Export Mix</button>
   </section>
 
-  <section class="panel help">
+  <section class="panel help nb-card">
     <p id="modeHelp">Tempo Lock: 4 bars at 100 BPM. Recording snaps to the grid.</p>
     <p class="keys">
       <kbd>R</kbd> record / punch out &nbsp;·&nbsp;

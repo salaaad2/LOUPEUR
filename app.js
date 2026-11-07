@@ -1215,7 +1215,7 @@ function startWaveLoop() {
 function buildTracks() {
   for (let i = 0; i < TRACK_COUNT; i++) {
     const tile = document.createElement("div");
-    tile.className = "track";
+    tile.className = "track nb-card";
     tile.dataset.index = i;
     tile.innerHTML = `
       <div class="track-head">
@@ -1223,10 +1223,10 @@ function buildTracks() {
         <span class="layers" data-layers="${i}">0</span>
       </div>
       <canvas class="wave" data-wave="${i}"></canvas>
-      <button type="button" class="primary" data-primary="${i}">RECORD</button>
+      <button type="button" class="primary nb-button" data-primary="${i}">RECORD</button>
       <div class="track-foot">
-        <button type="button" class="small" data-mute="${i}">MUTE</button>
-        <button type="button" class="small" data-clear="${i}">CLEAR</button>
+        <button type="button" class="small nb-button" data-mute="${i}">MUTE</button>
+        <button type="button" class="small nb-button" data-clear="${i}">CLEAR</button>
       </div>`;
     el.tracks.appendChild(tile);
   }
