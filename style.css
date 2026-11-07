@@ -137,7 +137,9 @@ select {
    gets a wider column and truncates instead of stretching the panel. */
 #mic {
   max-width: 220px;
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .segmented {

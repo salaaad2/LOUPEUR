@@ -5,17 +5,24 @@
 // ---------------------------------------------------------------------------
 
 const TRACK_COUNT = 4;
-const LOOKAHEAD_MS = 25;
-const SCHEDULE_AHEAD = 0.1;      // seconds
-const SEAM_SECONDS = 0.008;
-const RAMP_SECONDS = 0.01;
+
+// Transport
+const LOOKAHEAD_MS = 25;         // scheduler tick
+const SCHEDULE_AHEAD = 0.1;      // seconds scheduled ahead of the clock
+const RAMP_SECONDS = 0.01;       // mute / master ramp, avoids clicks
 const REVERB_RAMP = 0.02;
+
+// Recording
+const SEAM_SECONDS = 0.008;      // crossfade folded into the loop point
 const MIN_LOOP_SECONDS = 0.5;
 const MAX_TAKE_SECONDS = 8 * 60;
-const FREE_TOLERANCE = 0.05;     // seconds
+const FREE_TOLERANCE = 0.05;     // seconds a later Free Mode take may miss L by
+const LATENCY_MARGIN = 0.005;    // covers the worklet's 128-sample block
+
+// UI
 const CLEAR_HOLD_MS = 600;
+const WAVE_BUCKETS = 200;
 const EXPORT_TAIL = 1;           // seconds of reverb tail
-const LATENCY_MARGIN = 0.005;    // seconds, covers the worklet's 128-sample block
 
 // ---------------------------------------------------------------------------
 // State
@@ -31,7 +38,7 @@ const state = {
   micId: "",             // "" = system default input
   selected: 0,
   transport: "stopped",  // "stopped" | "running"
-  loopLength: 0,         // samples, 0 = undefined
+  loopLength: 0,         // samples; 0 = no loop exists yet
   t0: 0,                 // AudioContext time of loop sample 0
   channels: [],
 };
@@ -49,7 +56,7 @@ let inputLatency = 0;        // seconds, mic buffer; see measureInputLatency
 let schedulerTimer = null;
 let armTimer = null;         // promotes an armed take at its loop boundary
 let nextBoundaryIndex = 0;   // next loop index to schedule
-let pendingRecord = null;    // { channel, startFrame, endFrame } while capturing
+let pendingRecord = null;    // the take in progress, see armCapture
 let liveEnv = null;          // envelope of the take in progress, for the waveform
 let countInOscs = [];        // clicks of a count-in that has not finished yet
 
@@ -121,7 +128,6 @@ async function initAudio() {
       layers: 0,
       env: null,        // cached waveform envelope
       envBuffer: null,  // buffer the envelope was computed from
-      anchorTime: null, // loop time the buffer starts at, null = loop top
     });
   }
 
@@ -360,34 +366,25 @@ function onCaptureFrame(e) {
   target.set(data.subarray(offset, offset + count), writeAt);
   rec.lastFrame = to - 1;
 
-  // Fold the new samples into the live envelope so the waveform fills in as
-  // the take arrives. Buckets are fixed, so the envelope is rescaled to the
-  // captured length on every block: one pass over 200 floats, not the take.
+  // Fold the new samples into the live envelope. The envelope is a fixed grid
+  // over the whole scratch buffer, so a block only touches the buckets it
+  // covers: cost is O(block), not O(take). Rescaling the envelope to the
+  // captured length on every block instead would rescan the entire take each
+  // time, which is quadratic and glitches capture on long takes.
   const buckets = liveEnv.length;
-  const total = writeAt + count;
-  const prev = liveEnv.slice();
-  const prevTotal = rec.envTotal || 0;
-  liveEnv.fill(0);
-  for (let b = 0; b < buckets; b++) {
-    const from2 = Math.floor((b * total) / buckets);
-    const to2 = Math.min(total, Math.floor(((b + 1) * total) / buckets));
-    let peak = 0;
-    // Carry over the peak of the old bucket that overlaps this one.
-    if (prevTotal > 0) {
-      const pFrom = Math.floor((b * prevTotal) / buckets);
-      const pTo = Math.min(prevTotal, Math.floor(((b + 1) * prevTotal) / buckets));
-      for (let i = pFrom; i < pTo; i++) {
-        const v = prev[Math.min(buckets - 1, Math.floor((i * buckets) / prevTotal))];
-        if (v > peak) peak = v;
-      }
-    }
-    for (let i = from2; i < to2; i++) {
+  const per = target.length / buckets;
+  const firstBucket = Math.floor(writeAt / per);
+  const lastBucket = Math.min(buckets - 1, Math.floor((writeAt + count - 1) / per));
+  for (let b = firstBucket; b <= lastBucket; b++) {
+    const bFrom = Math.max(writeAt, Math.floor(b * per));
+    const bTo = Math.min(writeAt + count, Math.floor((b + 1) * per));
+    let peak = liveEnv[b];
+    for (let i = bFrom; i < bTo; i++) {
       const v = target[i] < 0 ? -target[i] : target[i];
       if (v > peak) peak = v;
     }
     liveEnv[b] = peak;
   }
-  rec.envTotal = total;
 
   if (to >= end) finishCapture();
 }
@@ -395,13 +392,13 @@ function onCaptureFrame(e) {
 // Transport
 // ---------------------------------------------------------------------------
 
+// The musical loop length in samples, derived from BPM and bars. Never
+// shortened by the seam: capture runs seamSamples(L) longer and foldSeam
+// crossfades that tail into the head, so the buffer is exactly L and the last
+// beat is not cut. Free Mode has no grid, so it uses the length the first take
+// defined.
 function loopSamples() {
   if (state.mode === "tempo") {
-    // The grid is the musical length, unshortened. Capture runs seamSamples(L)
-    // longer than this and foldSeam crossfades that extra tail into the head,
-    // so the buffer is exactly L samples and no audio is lost. Subtracting the
-    // seam here would make the loop 8 ms short of the bar grid and cut the
-    // tail of the last beat.
     return Math.round(state.bars * 4 * (60 / state.bpm) * ctx.sampleRate);
   }
   return state.loopLength;
@@ -411,10 +408,10 @@ function seamSamples(length) {
   return Math.min(Math.round(SEAM_SECONDS * ctx.sampleRate), Math.floor(length / 2));
 }
 
-// First loop boundary at or after `after`. Used for mute ramps, later-track
-// record starts, overdub starts, and resume. Not used to start a take that has
-// already been recorded: its anchor may be in the past, and the next boundary
-// would then be a whole loop away. See schedulePending.
+// First loop boundary at or after `after`. Used for mute ramps, record starts,
+// overdub starts, and resume. Never used to enter a take that has already been
+// recorded: its start may be in the past, and the next boundary would then be a
+// whole loop away. See schedulePending.
 function nextBoundaryTime(after) {
   const L = loopSamples() / ctx.sampleRate;
   if (!L) return after;
@@ -440,41 +437,37 @@ function startTransport(atTime) {
 // the transport starts or a take is committed, so a freshly recorded track is
 // heard immediately instead of after a full loop of silence.
 //
-// Every take is entered at the loop position the transport has already
-// reached, computed from its anchor. A take whose anchor is still ahead (a
-// later track armed at the loop top, committed before that boundary arrives)
-// waits for the boundary; one whose anchor has already gone by — the first
-// Free Mode take, or a later take that finished at the end of its window — is
-// entered right away. Waiting for the *next* boundary in that case would skip
-// a whole loop, which is the "full run before any sound" symptom.
+// A take whose start is still ahead (a later track armed at the loop top,
+// committed before that boundary arrives) waits for it; one whose start has
+// already gone by is entered right away at the position the transport has
+// reached. Waiting for the *next* boundary in that case would skip a whole
+// loop, which is the "full run before any sound" symptom.
 function schedulePending() {
   if (state.transport !== "running" || !ctx) return;
-  const L = loopSamples();
-  if (!L) return;
+  if (!loopSamples()) return;
   const now = ctx.currentTime;
+  // The offset must be measured at the time the source actually starts, not at
+  // "now": when t0 is still ahead (a count-in), starting at t0 with the offset
+  // of "now" would enter the take partway through instead of at the loop top.
+  const when = Math.max(now, state.t0);
   for (const ch of state.channels) {
     if (!ch.buffer || ch.source) continue;
     if (ch.state !== "playing" && ch.state !== "overdubbing") continue;
-    const anchor = ch.anchorTime || state.t0;
-    const when = anchor > now ? anchor : now;
     scheduleChannel(ch, when, loopOffset(ch, when));
   }
 }
 
-// Loop position, in samples, that a channel's buffer starts at when its
-// source is started at `when`, measured from the channel's anchor (its own
-// anchorTime, or the loop top).
+// Loop position, in samples, that a channel's buffer starts at when its source
+// is started at `when`.
 //
-// The modulo is taken in samples, against the buffer's own length, not against
-// loopSamples(). The two differ by the seam: a Free Mode take is folded to
-// `L - seam`, so a modulo against `L` would leave the source up to `seam`
-// samples short of the loop top and every take would enter shifted right by
-// that much. The buffer length is the only length the source actually has.
+// The modulo is taken against the buffer's own length, not loopSamples(). The
+// two differ by the seam in Free Mode, and the buffer length is the only length
+// the source actually loops on; a modulo against L would leave the source up to
+// `seam` samples short of the loop top.
 function loopOffset(ch, when) {
-  const anchor = ch.anchorTime || state.t0;
   const L = ch.buffer ? ch.buffer.length : loopSamples();
   if (!L) return 0;
-  const elapsed = Math.round((when - anchor) * ctx.sampleRate);
+  const elapsed = Math.round((when - state.t0) * ctx.sampleRate);
   return ((elapsed % L) + L) % L;
 }
 
@@ -606,47 +599,39 @@ async function beginRecord(ch) {
   const ok = await ensureMic();
   if (!ok) return;
 
-  // A loop already exists: punch in at the loop top, in both modes. The take
-  // is armed now and capture opens at the next loop boundary, which is also
-  // loop sample 0, so what the user hears while recording is what plays back.
-  // The branch is loopLength, not mode: in Tempo Lock loopLength is what marks
-  // "a loop exists", and the grid is derived from BPM and bars.
+  // A loop already exists: punch in at the loop top, in both modes. The take is
+  // armed now and capture opens at the next loop boundary, which is also loop
+  // sample 0, so what the user hears while recording is what plays back.
   if (state.loopLength) {
-    const L = state.loopLength;
-    const raw = L + seamSamples(L);
-    // If the transport is stopped, t0 is stale and there is no boundary to
-    // wait for: restart the loop from the top and record from there.
-    if (state.transport !== "running") {
-      startTransport(ctx.currentTime + 0.05);
-    }
-    const startAt = nextBoundaryTime(ctx.currentTime + 0.05);
-    armCapture(ch, startAt, startAt + raw / ctx.sampleRate, raw);
-    ch.state = "armed";
-    startArmTimer();
+    // If the transport is stopped, t0 is stale and there is no boundary to wait
+    // for: restart the loop from the top and record from there.
+    if (state.transport !== "running") startTransport(ctx.currentTime + 0.05);
+    armTake(ch, nextBoundaryTime(ctx.currentTime + 0.05), state.loopLength);
   } else if (state.mode === "tempo") {
     // First Tempo Lock take: count in, then start the transport on beat 5.
-    const L = loopSamples();
-    const raw = L + seamSamples(L);
     const beat = 60 / state.bpm;
     const countInStart = ctx.currentTime + 0.1;
     playCountIn(countInStart, beat);
     const armAt = countInStart + 4 * beat;
+    state.loopLength = loopSamples();
     startTransport(armAt);
-    state.loopLength = L;
-    // Capture L + seam samples; foldSeam crossfades the extra tail into the
-    // head and returns exactly L, so the last beat is not cut.
-    armCapture(ch, armAt, armAt + raw / ctx.sampleRate, raw);
-    // Armed through the count-in, promoted to RECORDING at beat 5, so the
-    // press can be cancelled before any audio is captured.
-    ch.state = "armed";
-    startArmTimer();
+    armTake(ch, armAt, state.loopLength);
   } else {
     // First Free Mode take: free-running, length fixed at punch-out.
-    const startAt = ctx.currentTime + 0.05;
-    armCapture(ch, startAt, Infinity, 0);
+    armCapture(ch, ctx.currentTime + 0.05, Infinity, 0);
     ch.state = "recording";
   }
   render();
+}
+
+// Arms a take that runs exactly `length` samples from `startAt`, plus the seam
+// tail that foldSeam folds back into the head. The channel waits in ARMED until
+// the boundary arrives; see promoteArmed.
+function armTake(ch, startAt, length) {
+  const raw = length + seamSamples(length);
+  armCapture(ch, startAt, startAt + raw / ctx.sampleRate, raw);
+  ch.state = "armed";
+  startArmTimer();
 }
 
 function armCapture(ch, startTime, endTime, lengthSamples) {
@@ -661,21 +646,22 @@ function armCapture(ch, startTime, endTime, lengthSamples) {
     channel: ch,
     // Resolved from the first captured block; see onCaptureFrame.
     startFrame: null,
-    // Frame the capture window opens at. Blocks before it are discarded, so
-    // an armed take begins exactly at the loop boundary.
+    // Frame the capture window opens at. Blocks before it are discarded, so an
+    // armed take begins exactly at the loop boundary.
     startFramePredicted: Math.round(startTime * ctx.sampleRate) - shift,
     lastFrame: null,
     endFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) - shift,
     lengthSamples: lengthSamples || 0,
     scratch: new Float32Array(cap),
-    freeMode: state.mode === "free" && !state.loopLength,
+    // True only for the first Free Mode take, which defines the loop length
+    // instead of matching it.
+    definesLoop: state.mode === "free" && !state.loopLength,
     overdub: false,
-    // AudioContext time the capture window opens. An armed take waits for
-    // this before it counts as recording.
+    // AudioContext time the capture window opens. An armed take waits for this
+    // before it counts as recording.
     startTime,
     // When the arm began, so the waveform can show the wait as a progress bar.
     armedAt: ctx.currentTime,
-    envTotal: 0,      // samples the live envelope currently spans
   };
   liveEnv = new Float32Array(WAVE_BUCKETS);
 }
@@ -690,48 +676,43 @@ function finishCapture() {
   const ch = rec.channel;
   const rate = ctx.sampleRate;
 
+  // A rejected take leaves the channel empty and says why.
+  const reject = (msg) => {
+    ch.state = "empty";
+    showBanner(msg);
+    render();
+  };
+
   let length;
-  if (rec.freeMode) {
+  if (rec.definesLoop) {
     // The take ends where the user punched out, not where the buffer ends.
-    // Both ends are in mic frames, so the latency cancels out of the length;
-    // it only moves where the loop sits on the transport clock.
+    // Both ends are in mic frames, so the latency cancels out of the length; it
+    // only moves where the loop sits on the transport clock.
     const start = rec.startFrame === null ? Math.round(ctx.currentTime * rate) : rec.startFrame;
     const recorded = rec.endFrame === Infinity
       ? Math.round(ctx.currentTime * rate) - Math.round(inputLatency * rate) - start
       : rec.endFrame - start;
     length = Math.max(1, Math.min(recorded, rec.scratch.length));
     if (length / rate < MIN_LOOP_SECONDS) {
-      ch.state = "empty";
-      showBanner("Take too short. Record at least half a second.");
-      render();
-      return;
+      return reject("Take too short. Record at least half a second.");
     }
     state.loopLength = length;
     // startFrame is a mic frame, so it is already the render time the take
-    // belongs at: the latency correction is baked into the window, not
-    // applied again here.
+    // belongs at: the latency correction is baked into the window, not applied
+    // again here.
     state.t0 = start / rate;
   } else {
     length = state.loopLength;
 
-    // A later Free Mode take must match the existing loop. The capture window
-    // is already L + n samples, so a take that ended early means the user
-    // punched out before the loop finished. An armed take that never reached
-    // its boundary has no startFrame at all.
+    // A later Free Mode take must match the existing loop. The capture window is
+    // already L + seam samples, so a take that ended early means the user
+    // punched out before the loop finished. An armed take that never reached its
+    // boundary has no startFrame at all.
     if (state.mode === "free" && rec.endFrame !== Infinity) {
-      if (rec.startFrame === null) {
-        ch.state = "empty";
-        showBanner("That take did not match the loop length. Try again.");
-        render();
-        return;
-      }
-      const got = rec.endFrame - rec.startFrame;
+      const got = rec.startFrame === null ? 0 : rec.endFrame - rec.startFrame;
       const want = length + seamSamples(length);
       if (Math.abs(got - want) > FREE_TOLERANCE * rate) {
-        ch.state = "empty";
-        showBanner("That take did not match the loop length. Try again.");
-        render();
-        return;
+        return reject("That take did not match the loop length. Try again.");
       }
     }
   }
@@ -750,45 +731,46 @@ function finishCapture() {
     return;
   }
 
-  // In Tempo Lock the capture holds L + seam samples, so fold all of it back
-  // to L. In Free Mode the take is exactly what was recorded, and the fold
-  // trims its own tail.
-  const captured = rec.freeMode ? length : Math.min(rec.scratch.length, length + seamSamples(length));
-  const raw = rec.scratch.subarray(0, captured);
-  const folded = foldSeam(raw);
+  // In Tempo Lock the capture holds L + seam samples, so fold all of it back to
+  // L. In Free Mode the take is exactly what was recorded, and the fold trims
+  // its own tail.
+  const captured = rec.definesLoop
+    ? length
+    : Math.min(rec.scratch.length, length + seamSamples(length));
+  const folded = foldSeam(rec.scratch.subarray(0, captured));
   const buf = ctx.createBuffer(1, folded.length, rate);
   buf.getChannelData(0).set(folded);
 
   // The first Free Mode take defines the loop from its folded length.
-  if (rec.freeMode) {
+  if (rec.definesLoop) {
     state.loopLength = folded.length;
     startTransport(state.t0);
   }
   ch.buffer = buf;
   ch.layers = 1;
   ch.state = "playing";
-  // Loop position the buffer starts at. Every take is anchored to the loop
-  // top: a later take is captured from the boundary, and the first Free Mode
-  // take defines t0 as the frame its own capture began at, so its buffer
-  // starts at loop sample 0 too. Anchoring it to t0 is what keeps it in phase
-  // with the tracks recorded after it.
-  ch.anchorTime = null;
-  // Enter the take at the loop position the transport has reached, instead of
-  // waiting for the next boundary, which is a whole loop away.
-  //
-  // A later take is entered at its own start boundary, not at "now". Its
-  // capture window is L + seam long, so finishCapture fires seam samples after
-  // the boundary it began on; entering at "now" would start the buffer seam
-  // samples into itself and play the whole take late by that much. The buffer
-  // is L long and the transport's loop is L + seam, so the error never
-  // cancels. The first Free Mode take has no boundary to wait for: it defines
-  // t0 itself and is entered immediately.
-  if (rec.freeMode) {
+
+  // A later take is entered at its own start boundary, not at "now". Its capture
+  // window is L + seam long, so finishCapture fires seam samples after the
+  // boundary it began on; entering at "now" would start the buffer seam samples
+  // into itself and play the whole take late by that much. The first Free Mode
+  // take has no boundary to wait for: it defines t0 itself and is entered
+  // immediately.
+  if (rec.definesLoop) {
     schedulePending();
   } else {
     scheduleChannel(ch, rec.startTime, 0);
   }
   render();
+}
+
+// True while a channel is capturing a take that must run its full length, so
+// there is nothing to punch out of. A later Free Mode track is fixed by the
+// first take's length; an overdub always runs a full loop.
+function isLockedTake(ch) {
+  if (!pendingRecord || pendingRecord.channel !== ch) return false;
+  if (ch.state === "overdubbing") return true;
+  return ch.state === "recording" && !pendingRecord.definesLoop;
 }
 
 function punchOut(ch) {
@@ -800,8 +782,8 @@ function punchOut(ch) {
       stopArmTimer();
     }
     // A first Tempo Lock take is armed through its count-in, so cancelling it
-    // must also silence the clicks still queued and stop the transport that
-    // was started for it. A later take is armed against a loop that is already
+    // must also silence the clicks still queued and stop the transport that was
+    // started for it. A later take is armed against a loop that is already
     // running: the master track keeps playing and only the take is dropped.
     if (state.mode === "tempo") {
       stopCountIn();
@@ -820,11 +802,11 @@ function punchOut(ch) {
       return;
     }
     if (!pendingRecord) return;
-    if (pendingRecord.freeMode) {
+    if (pendingRecord.definesLoop) {
       // First take: the length is whatever was captured up to now. The worklet
       // delivers blocks asynchronously, so the take ends at the last frame we
-      // actually received, not at the wall clock. That frame is a mic frame,
-      // so it is already latency-corrected like the start.
+      // actually received, not at the wall clock. That frame is a mic frame, so
+      // it is already latency-corrected like the start.
       const rec = pendingRecord;
       if (rec.startFrame === null) {
         finishCapture();
@@ -833,23 +815,20 @@ function punchOut(ch) {
       rec.endFrame = rec.lastFrame === null ? rec.startFrame : rec.lastFrame + 1;
       finishCapture();
     } else {
-      // Later Free Mode track: the loop length is already fixed by the first
-      // take, so this take runs to the end of the loop on its own. Punching
-      // out early would leave a short take that cannot be looped, so the
-      // press is ignored.
       showBanner("This track records for the full loop length. It stops on its own.");
     }
   } else if (ch.state === "overdubbing") {
-    if (!pendingRecord) return;
-    // Overdub always runs a full loop; punch-out just stops the badge early.
-    ch.state = "playing";
-    render();
+    showBanner("The overdub runs to the end of the loop. It stops on its own.");
   }
 }
 
 // Crossfades the last n samples of the take into its first n samples and
 // returns a buffer shortened by n. The loop point then lands where the tail
 // hands over to the head, so the seam is continuous in value.
+//
+// The weights are linear, not equal-power: both halves are the same signal, so
+// they must sum to 1. Equal-power weights sum to 1.41 at the midpoint, which
+// puts a 20% amplitude bump on every sustained note at the loop point.
 function foldSeam(data) {
   const n = seamSamples(data.length);
   if (n < 2) return data;
@@ -857,9 +836,7 @@ function foldSeam(data) {
   const out = data.slice(0, data.length - n);
   for (let i = 0; i < n; i++) {
     const t = i / n;
-    const headW = Math.sin((t * Math.PI) / 2); // head fades in
-    const tailW = Math.cos((t * Math.PI) / 2); // tail fades out
-    out[i] = data[i] * headW + data[data.length - n + i] * tailW;
+    out[i] = data[i] * t + data[data.length - n + i] * (1 - t);
   }
   return out;
 }
@@ -874,7 +851,6 @@ function beginOverdub(ch) {
   const startAt = nextBoundaryTime(ctx.currentTime + 0.05);
   armCapture(ch, startAt, startAt + L / ctx.sampleRate, L);
   pendingRecord.overdub = true;
-  pendingRecord.freeMode = false;
   ch.state = "overdubbing";
   render();
 }
@@ -920,25 +896,21 @@ function clearChannel(ch) {
   ch.muted = false;
   ch.envBuffer = null;
   ch.env = null;
-  ch.anchorTime = null;
   const g = ch.gain.gain;
   g.cancelScheduledValues(ctx.currentTime);
   g.setValueAtTime(1, ctx.currentTime);
 
-  if (state.mode === "free") {
-    const remaining = state.channels.filter((c) => c.buffer);
-    if (remaining.length === 0) {
-      state.loopLength = 0;
-      stopTransport();
-    } else {
-      state.loopLength = remaining[0].buffer.length;
-    }
-  } else if (!state.channels.some((c) => c.buffer)) {
-    // Tempo Lock: the grid is derived from BPM and bars, but loopLength is
-    // what marks "a loop exists". Clearing the last track must drop it, or the
-    // next record press would arm against a loop with nothing in it.
+  // loopLength is what marks "a loop exists" in both modes, so it has to follow
+  // the buffers. In Free Mode the surviving tracks define the length; in Tempo
+  // Lock the grid is derived from BPM and bars, but the flag still has to drop
+  // when the last track goes, or the next record press would arm against a loop
+  // with nothing in it.
+  const remaining = state.channels.filter((c) => c.buffer);
+  if (!remaining.length) {
     state.loopLength = 0;
     stopTransport();
+  } else if (state.mode === "free") {
+    state.loopLength = remaining[0].buffer.length;
   }
   render();
 }
@@ -958,9 +930,9 @@ function playCountIn(startTime, beat) {
 // armed Tempo Lock take is cancelled, so the user is not left listening to a
 // count-in for a take that no longer exists.
 function stopCountIn() {
-  if (!countInOscs.length) return;
   const now = ctx.currentTime;
   for (const osc of countInOscs) {
+    osc.onended = null;
     try { osc.stop(now); } catch (_) {}
   }
   countInOscs.length = 0;
@@ -1081,8 +1053,6 @@ function download(blob, name) {
 // Waveform display
 // ---------------------------------------------------------------------------
 
-const WAVE_BUCKETS = 200;
-
 // Reduces a Float32Array to per-bucket peak amplitudes in 0..1. Computed once
 // per buffer change, not per frame.
 function computeEnvelope(samples, buckets) {
@@ -1151,11 +1121,14 @@ function drawWave(ch, canvas) {
     const filled = rec.lastFrame === null || rec.startFrame === null
       ? 0
       : rec.lastFrame - rec.startFrame + 1;
-    // liveEnv is accumulated block by block in onCaptureFrame, so it already
-    // spans exactly the captured region: draw all of it. Scaling by
-    // filled / scratch.length would shrink the picture to nothing, because in
-    // Free Mode the scratch buffer is the full 8-minute maximum.
-    drawEnvelope(g, liveEnv, cssW, cssH, mid, color);
+    // liveEnv is a fixed grid over the whole scratch buffer, so only the
+    // buckets covering the captured region hold anything. Draw that fraction at
+    // full width, so the waveform stretches to fill the canvas as the take
+    // grows. In Free Mode the scratch buffer is the full 8-minute maximum, so
+    // drawing all of it would shrink the picture to a sliver at the left edge.
+    const span = rec.scratch.length;
+    const used = Math.max(1, Math.ceil((filled / span) * liveEnv.length));
+    drawEnvelope(g, liveEnv.subarray(0, used), cssW, cssH, mid, color);
 
     // Progress against the maximum take length, so elapsed time is visible
     // even though the waveform itself always fills the width.
@@ -1329,19 +1302,20 @@ function render() {
     tile.classList.toggle("selected", state.selected === i);
 
     const primary = tile.querySelector("[data-primary]");
-    // A later Free Mode track cannot be punched out: its length is fixed by
-    // the first take, so the button only reports progress. An armed take is
-    // always cancellable, in both modes.
-    const locked = ch.state === "recording" && pendingRecord && !pendingRecord.freeMode;
-    // An armed take counts down to its punch-in, so the wait is legible
-    // instead of a dead press. Driven by the transport clock, not by audio.
+    // A take that runs a fixed length cannot be punched out: a later Free Mode
+    // track (its length is fixed by the first take) and an overdub (it always
+    // runs a full loop). The button only reports progress for those. An armed
+    // take is always cancellable, in both modes.
+    const locked = isLockedTake(ch);
+    // An armed take counts down to its punch-in, so the wait is legible instead
+    // of a dead press. Driven by the transport clock, not by audio.
     const countdown = ch.state === "armed" ? armCountdown(ch) : 0;
     const labels = {
       empty: "RECORD",
       armed: countdown ? `IN ${countdown}` : "ARMED",
       recording: locked ? "RECORDING…" : "STOP REC",
       playing: "OVERDUB",
-      overdubbing: "STOP DUB",
+      overdubbing: locked ? "DUBBING…" : "STOP DUB",
     };
     primary.textContent = labels[ch.state] || "RECORD";
     primary.dataset.state = ch.state;
