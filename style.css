@@ -4,16 +4,16 @@
    dark-blue palette: navy panels, near-black borders and offset shadows. */
 
 :root {
-  --bg: #0b0f1a;
-  --panel: #16203a;
-  --panel-2: #1d2a4a;
-  --line: #05070d;
-  --text: #e6ecff;
-  --dim: #8fa2c9;
-  --rec: #e5484d;
-  --play: #30a46c;
-  --dub: #f5a524;
-  --accent: #5b8def;
+  --bg: #070b14;
+  --panel: #1b2748;
+  --panel-2: #24345c;
+  --line: #02040a;
+  --text: #f2f6ff;
+  --dim: #a9bce0;
+  --rec: #ff4d55;
+  --play: #2fd07f;
+  --dub: #ffb020;
+  --accent: #6ea0ff;
 
   --nb-border: 3px;
   --nb-shadow: 6px 6px 0 var(--line);
@@ -54,11 +54,12 @@ body {
 .header h1 {
   margin: 0;
   font-family: var(--nb-font);
-  font-size: 22px;
+  font-size: 24px;
   font-weight: 900;
   letter-spacing: 0.02em;
   text-transform: uppercase;
   color: var(--text);
+  text-shadow: 3px 3px 0 var(--line);
 }
 
 .badge {
@@ -68,7 +69,7 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--bg);
-  background: var(--accent);
+  background: var(--dub);
   border: 2px solid var(--line);
   box-shadow: 3px 3px 0 var(--line);
   padding: 4px 10px;
@@ -309,15 +310,35 @@ input.nb-checkbox:checked::before {
   transition: box-shadow 0.12s, transform 0.12s;
 }
 
+/* Each track owns a hue. It tints the tile's top bar, name and small buttons
+   so the four tracks are distinguishable at a glance. The transport states
+   (armed / recording / playing / overdubbing) override it on the big button
+   and the waveform, so a live state always reads louder than the track hue. */
+.track[data-index="0"] { --track: #83e28b; }
+.track[data-index="1"] { --track: #98bfe7; }
+.track[data-index="2"] { --track: #e6acec; }
+.track[data-index="3"] { --track: #c0f1ed; }
+
+.track::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
+  background: var(--track);
+  border-bottom: 2px solid var(--line);
+}
+
 .track:hover { box-shadow: var(--nb-shadow); transform: none; }
 
-/* Active track: accent border, accent name. */
+/* Active track: its own hue on the border and a lifted panel. */
 .track.selected {
-  border-color: var(--accent);
+  border-color: var(--track);
   background: #1a2544;
 }
 
-.track.selected .track-name { color: var(--accent); }
+.track.selected .track-name { color: var(--track); }
 
 .wave {
   display: block;
@@ -340,7 +361,7 @@ input.nb-checkbox:checked::before {
   font-weight: 900;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--dim);
+  color: var(--track);
 }
 
 .layers {
@@ -349,7 +370,7 @@ input.nb-checkbox:checked::before {
   font-weight: 900;
   font-variant-numeric: tabular-nums;
   color: var(--bg);
-  background: var(--dim);
+  background: var(--track);
   border: 2px solid var(--line);
   padding: 0 6px;
   visibility: hidden;
@@ -357,7 +378,9 @@ input.nb-checkbox:checked::before {
 
 .layers.show { visibility: visible; }
 
-/* The big per-track button. State colours come from data-state. */
+/* The big per-track button. Idle it wears the track hue; the four transport
+   states override it, and they are declared after the hover rules so a live
+   state never gets washed out by a pointer resting on the button. */
 .primary {
   width: 100%;
   min-height: 92px;
@@ -365,8 +388,8 @@ input.nb-checkbox:checked::before {
   border: 2px solid var(--line);
   border-radius: 0;
   box-shadow: var(--nb-shadow-sm);
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--track);
+  color: var(--bg);
   font-family: var(--nb-font);
   font-size: 14px;
   font-weight: 900;
@@ -378,8 +401,6 @@ input.nb-checkbox:checked::before {
 
 .primary:hover,
 .primary:focus {
-  background: var(--panel-2);
-  color: var(--text);
   box-shadow: 2px 2px 0 var(--line);
   transform: translate(2px, 2px);
 }
@@ -403,7 +424,7 @@ input.nb-checkbox:checked::before {
   border-radius: 0;
   box-shadow: 3px 3px 0 var(--line);
   background: var(--panel-2);
-  color: var(--dim);
+  color: var(--track);
   font-family: var(--nb-font);
   font-size: 10px;
   font-weight: 900;
@@ -418,8 +439,8 @@ input.nb-checkbox:checked::before {
 
 .small:hover,
 .small:focus {
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--track);
+  color: var(--bg);
   box-shadow: 1px 1px 0 var(--line);
   transform: translate(2px, 2px);
 }

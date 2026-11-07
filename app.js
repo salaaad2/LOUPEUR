@@ -1082,13 +1082,21 @@ function envelopeFor(ch) {
   return ch.env;
 }
 
+// Transport states own their colour so a live state always reads louder than
+// the track's own hue. An idle track draws in its hue, matching the tile.
 const WAVE_COLORS = {
-  empty: "#3a4152",
   armed: "#5b8def",
   recording: "#e5484d",
   playing: "#30a46c",
   overdubbing: "#f5a524",
 };
+
+// Must stay in step with the --track hues in style.css.
+const TRACK_COLORS = ["#83e28b", "#98bfe7", "#e6acec", "#c0f1ed"];
+
+function trackColor(ch) {
+  return TRACK_COLORS[ch.index % TRACK_COLORS.length];
+}
 
 function drawWave(ch, canvas) {
   const dpr = window.devicePixelRatio || 1;
@@ -1104,7 +1112,7 @@ function drawWave(ch, canvas) {
   g.clearRect(0, 0, cssW, cssH);
 
   const mid = cssH / 2;
-  const color = WAVE_COLORS[ch.state] || WAVE_COLORS.empty;
+  const color = WAVE_COLORS[ch.state] || trackColor(ch);
 
   // Centre line.
   g.strokeStyle = "#252a36";
