@@ -83,13 +83,21 @@ because an armed take must still promote if the transport is stopped underneath
 it. Keying off the first captured block would flip the label a few milliseconds
 late and make the state invisible.
 
-## The live envelope spans the captured region
+## A take of known length is drawn as a timeline
 
-`liveEnv` is refolded block by block in `onCaptureFrame` and drawn at full width,
-so the waveform stretches to fill the canvas as the take grows. Never scale it
-by `scratch.length`: in Free Mode the first take's scratch buffer is the full
-8-minute maximum, which maps every block into bucket 0 and draws a 2%-wide
-sliver at the left edge.
+When `rec.lengthSamples` is set (Tempo Lock, overdub), `drawEnvelopeTimeline`
+maps the canvas to the take length: bucket `b` sits at `(b * per - head) / length`
+of the width, so the wave grows left to right and the part not yet recorded
+stays empty. `head` is subtracted because the scratch buffer opens that many
+samples before the take.
+
+Stretching the captured fraction to full width instead re-scaled the whole
+picture on every block, which read as peaks arriving from the right and
+compressing the space.
+
+The first Free Mode take has no length until punch-out, so it keeps the stretch:
+its scratch buffer is the full 8-minute maximum, and drawing all of it would
+shrink the picture to a sliver at the left edge.
 
 ## The live envelope is a fixed grid over the scratch buffer
 
@@ -102,11 +110,11 @@ rescanned the entire take each time, which is quadratic: a 2-minute take cost
 ~11M operations per 128-sample block, on the main thread, every ~2.7 ms. It
 glitches capture, which is the one failure this app cannot tolerate.
 
-`drawWave` draws only the first `filled / scratch.length` fraction of the
-envelope, at full width, so the waveform still stretches to fill the canvas as
-the take grows. Never draw the whole envelope: in Free Mode the scratch buffer is
-the full 8-minute maximum, which shrinks the picture to a sliver at the left
-edge.
+`drawWave` draws the live envelope through `drawEnvelopeTimeline` when the take
+length is known, and through the stretched `filled / scratch.length` fraction
+otherwise. Never draw the whole envelope stretched: in Free Mode the scratch
+buffer is the full 8-minute maximum, which shrinks the picture to a sliver at the
+left edge.
 
 ## One buffer per channel, replaced at the boundary
 

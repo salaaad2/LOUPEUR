@@ -704,6 +704,10 @@ function armCapture(ch, startTime, endTime, lengthSamples) {
     // Frame the capture window opens at. Blocks before it are discarded, so an
     // armed take begins exactly at the loop boundary.
     startFramePredicted: Math.round(startTime * ctx.sampleRate) - shift,
+    // Samples of pre-boundary audio at the head of `scratch`. The window opens
+    // `shift` before the boundary, so scratch index 0 is NOT the boundary: the
+    // waveform subtracts it to put the take at the left edge.
+    shift,
     lastFrame: null,
     endFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) - shift,
     lengthSamples: lengthSamples || 0,
@@ -1189,17 +1193,28 @@ function drawWave(ch, canvas) {
       ? 0
       : rec.lastFrame - rec.startFrame + 1;
     // liveEnv is a fixed grid over the whole scratch buffer, so only the
-    // buckets covering the captured region hold anything. Draw that fraction at
-    // full width, so the waveform stretches to fill the canvas as the take
-    // grows. In Free Mode the scratch buffer is the full 8-minute maximum, so
-    // drawing all of it would shrink the picture to a sliver at the left edge.
+    // buckets covering the captured region hold anything.
+    //
+    // A take of known length (Tempo Lock, overdub) is drawn as a timeline: the
+    // canvas spans `lengthSamples`, so the wave grows left to right and the
+    // part not yet recorded stays empty. Stretching the captured fraction to
+    // full width instead made every new block re-scale the whole picture, which
+    // read as peaks arriving from the right and compressing the space.
+    //
+    // The first Free Mode take has no length until punch-out, so it keeps the
+    // stretch: its scratch buffer is the full 8-minute maximum, and drawing all
+    // of it would shrink the picture to a sliver at the left edge.
     const span = rec.scratch.length;
-    const used = Math.max(1, Math.ceil((filled / span) * liveEnv.length));
-    drawEnvelope(g, liveEnv.subarray(0, used), cssW, cssH, mid, color);
-
-    // Progress against the maximum take length, so elapsed time is visible
-    // even though the waveform itself always fills the width.
     const total = rec.lengthSamples || Math.ceil(ctx.sampleRate * MAX_TAKE_SECONDS);
+    if (rec.lengthSamples) {
+      drawEnvelopeTimeline(g, liveEnv, span, rec.shift, rec.lengthSamples, cssW, cssH, mid, color);
+    } else {
+      const used = Math.max(1, Math.ceil((filled / span) * liveEnv.length));
+      drawEnvelope(g, liveEnv.subarray(0, used), cssW, cssH, mid, color);
+    }
+
+    // Progress against the take length, so elapsed time is visible even for the
+    // Free Mode take whose waveform fills the width.
     const frac = Math.max(0, Math.min(1, filled / total));
     g.fillStyle = color;
     g.fillRect(0, cssH - 2, cssW * frac, 2);
@@ -1249,6 +1264,28 @@ function drawEnvelope(g, env, cssW, cssH, mid, color) {
     const amp = Math.min(1, env[i]) * (mid - 2);
     if (amp <= 0.5) continue;
     g.fillRect(i * barW, mid - amp, Math.max(1, barW - 0.5), amp * 2);
+  }
+}
+
+// Draws a live envelope as a timeline: the canvas spans `length` samples of the
+// take, so a bucket sits at the position of the audio it holds and the region
+// not yet captured stays empty.
+//
+// `env` is a grid over the whole scratch buffer, which starts `shift` samples
+// before the take (the latency correction). Subtracting `shift` puts bucket 0
+// at the left edge instead of displacing the wave by that much.
+function drawEnvelopeTimeline(g, env, span, shift, length, cssW, cssH, mid, color) {
+  if (!(length > 0) || !env.length) return;
+  const per = span / env.length;
+  const scale = cssW / length;
+  g.fillStyle = color;
+  for (let i = 0; i < env.length; i++) {
+    const amp = Math.min(1, env[i]) * (mid - 2);
+    if (amp <= 0.5) continue;
+    const x = (i * per - shift) * scale;
+    if (x >= cssW) break;
+    const w = Math.max(1, per * scale - 0.5);
+    g.fillRect(Math.max(0, x), mid - amp, w, amp * 2);
   }
 }
 
