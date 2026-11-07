@@ -38,6 +38,7 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | BPM / Bars | Tempo Lock grid: 60–180 BPM, 1/2/4/8 bars |
 | Mode | Free (first take sets the length) or Tempo Lock (grid + count-in) |
 | Click track | Count-in and metronome, Tempo Lock only. Never recorded or exported |
+| Click while recording | Keeps the metronome ticking under a take, so you can play to the grid |
 | Microphone | Input picker; `Default input` follows the system default |
 | Reverb / Master | Global send and output level |
 | Export Mix | Renders the unmuted tracks to a 16-bit stereo WAV |

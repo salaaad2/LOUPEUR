@@ -33,6 +33,7 @@ const state = {
   bpm: 100,
   bars: 1,
   clickOn: true,
+  clickWhileRecording: false,  // metronome keeps ticking under a take
   reverbOn: false,
   master: 0.85,
   micId: "",             // "" = system default input
@@ -56,6 +57,7 @@ let inputLatency = 0;        // seconds, mic buffer; see measureInputLatency
 let schedulerTimer = null;
 let armTimer = null;         // promotes an armed take at its loop boundary
 let nextBoundaryIndex = 0;   // next loop index to schedule
+let nextBeatIndex = 0;       // next metronome beat to schedule, in beats from t0
 let pendingRecord = null;    // the take in progress, see armCapture
 let liveEnv = null;          // envelope of the take in progress, for the waveform
 let countInOscs = [];        // clicks of a count-in that has not finished yet
@@ -72,6 +74,7 @@ const el = {
   bars: document.getElementById("bars"),
   mode: document.getElementById("mode"),
   click: document.getElementById("click"),
+  clickRec: document.getElementById("clickRec"),
   mic: document.getElementById("mic"),
   reverb: document.getElementById("reverb"),
   master: document.getElementById("master"),
@@ -427,6 +430,10 @@ function startTransport(atTime) {
   // boundary that has not already gone by.
   const Lsec = loopSamples() / ctx.sampleRate;
   nextBoundaryIndex = Lsec ? Math.max(0, Math.ceil((ctx.currentTime - atTime) / Lsec)) : 0;
+  // The metronome counts beats from t0, so a transport that starts mid-beat
+  // (a resume) picks up on the next whole beat rather than re-clicking one.
+  const beatSec = 60 / state.bpm;
+  nextBeatIndex = Math.max(0, Math.ceil((ctx.currentTime - atTime) / beatSec));
   startScheduler();
   // Tracks that are already playing have no source after a stop; start them
   // now rather than waiting for the scheduler to reach a boundary.
@@ -527,6 +534,54 @@ function scheduleAhead() {
     }
     nextBoundaryIndex++;
   }
+
+  scheduleMetronome(horizon);
+}
+
+// Metronome under a take. Only runs when the user asked for it, the click
+// track is on, and a take is live or armed: the point is to play to the grid
+// while recording, not to leave a click running under playback.
+//
+// Beats are placed on the transport clock (t0 + n * beat) rather than on a
+// timer, so they stay locked to the loop even when the scheduler tick is late.
+// The accent falls on beat 1 of each bar, which is what makes the grid audible
+// while playing into it.
+function scheduleMetronome(horizon) {
+  if (!state.clickOn || !state.clickWhileRecording) return;
+  if (!takeInProgress()) return;
+  const beatSec = 60 / state.bpm;
+  if (!(beatSec > 0)) return;
+
+  // The cursor only advances while a take is live, so it falls behind whenever
+  // the click is paused between takes. Snap it forward to the first beat that
+  // has not gone by yet, instead of walking through the beats that elapsed,
+  // which would burn the guard and could skip the beat that is due now.
+  //
+  // The floor is the beat *before* the one due, not the due beat itself: a
+  // beat that is still ahead of the clock must be scheduled, and rounding up
+  // to the due beat would drop it whenever the scheduler tick lands a few
+  // milliseconds early. Beats already in the past are filtered below.
+  const due = Math.floor((ctx.currentTime - state.t0) / beatSec);
+  if (nextBeatIndex < due) nextBeatIndex = due;
+
+  let guard = 0;
+  while (state.t0 + nextBeatIndex * beatSec < horizon && guard++ < 64) {
+    const when = state.t0 + nextBeatIndex * beatSec;
+    // Skip beats already in the past (a transport started mid-beat).
+    if (when >= ctx.currentTime - 0.01) {
+      playClick(when, nextBeatIndex % 4 === 0, false);
+    }
+    nextBeatIndex++;
+  }
+}
+
+// True while a take is live or waiting to punch in. An armed take counts: the
+// grid has to run through the countdown so the punch-in lands on a beat the
+// user can hear, rather than the click dropping out and resuming late.
+function takeInProgress() {
+  return state.channels.some(
+    (c) => c.state === "armed" || c.state === "recording" || c.state === "overdubbing"
+  );
 }
 
 // An armed track becomes RECORDING once the loop top it was waiting for has
@@ -938,7 +993,10 @@ function stopCountIn() {
   countInOscs.length = 0;
 }
 
-function playClick(when, accent) {
+// `cancellable` marks a count-in click, which stopCountIn may silence. The
+// metronome passes false: its beats are not part of a count-in, and tracking
+// them would let a cancelled take kill the grid and grow the list without bound.
+function playClick(when, accent, cancellable = true) {
   const osc = ctx.createOscillator();
   const g = ctx.createGain();
   osc.frequency.value = accent ? 1600 : 1000;
@@ -949,6 +1007,7 @@ function playClick(when, accent) {
   g.connect(clickGain);
   osc.start(when);
   osc.stop(when + 0.08);
+  if (!cancellable) return;
   // Track the click so a cancelled count-in can silence the ones still ahead.
   countInOscs.push(osc);
   osc.onended = () => {
@@ -1383,6 +1442,18 @@ function bindControls() {
 
   el.click.addEventListener("change", () => {
     state.clickOn = el.click.checked;
+  });
+
+  el.clickRec.addEventListener("change", () => {
+    state.clickWhileRecording = el.clickRec.checked;
+    // Turning the metronome on mid-loop must not replay the beats already
+    // behind the playhead, so the cursor is re-seated on the first beat that
+    // has not gone by yet. Floor, not ceil: a beat still ahead of the clock
+    // must be scheduled, and rounding up would drop it.
+    if (ctx && state.transport === "running") {
+      const beatSec = 60 / state.bpm;
+      nextBeatIndex = Math.max(0, Math.floor((ctx.currentTime - state.t0) / beatSec));
+    }
   });
 
   el.mic.addEventListener("change", () => {
