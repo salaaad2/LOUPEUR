@@ -62,8 +62,17 @@ and re-enters it at the wrong offset. `scheduleChannel` clears `ch.source` in
 
 `armCapture` stores `startFramePredicted = round(startTime × sampleRate)`, shifted
 back by the input latency. `onCaptureFrame` drops blocks that end at or before
-it and sets `startFrame = max(frame, startFramePredicted)`. Anchoring to the
-first block that happens to arrive would start an armed take a block late.
+it, and the take is anchored to `startFramePredicted` itself.
+
+**Known defect, do not preserve it.** The code currently resolves the anchor as
+`startFrame = max(frame, startFramePredicted)`. The worklet delivers blocks on
+its own schedule, so the first block that overlaps the window almost always
+starts *after* the prediction; `max()` then picks that block and the latency
+correction is silently discarded. `endFrame` is recomputed from the wrong
+anchor, so the whole window slides with it. This is why every manual offset
+tried so far had no audible effect. The anchor must be the prediction, and the
+samples between the prediction and the first block must stay zero. See
+`ISSUE.md` 2.4a.
 
 The worklet stamps a block with the render frame it was processed at, but the
 samples inside it were captured `inputLatency` earlier. The window is shifted
@@ -72,8 +81,13 @@ the **window**, not the buffer, so the loop length, the seam fold and the
 boundary alignment are untouched. `startFrame` and `lastFrame` are therefore
 already mic frames: do not subtract the latency a second time.
 
-Only the input side matters. The click and the recorded audio share the render
-clock, so `outputLatency` cancels out of the looper's math.
+**Both sides matter.** An earlier version of this file claimed `outputLatency`
+cancels out because the click and the recorded audio share the render clock.
+That is wrong. The click is *scheduled* on the render clock but *heard*
+`outputLatency` later, so the player plays `outputLatency` late, and the take
+lands that much late. `outputLatency` is not read anywhere in `app.js` today,
+which is a guaranteed device-independent error on every take. See `ISSUE.md`
+2.3.
 
 ## ARMED is driven by the clock, not by audio
 
@@ -86,10 +100,17 @@ late and make the state invisible.
 ## A take of known length is drawn as a timeline
 
 When `rec.lengthSamples` is set (Tempo Lock, overdub), `drawEnvelopeTimeline`
-maps the canvas to the take length: bucket `b` sits at `(b * per - head) / length`
+maps the canvas to the take length: bucket `b` sits at `(b * per - shift) / length`
 of the width, so the wave grows left to right and the part not yet recorded
-stays empty. `head` is subtracted because the scratch buffer opens that many
+stays empty. `shift` is subtracted because the scratch buffer opens that many
 samples before the take.
+
+`shift` is the *predicted* head, not the resolved one. The audio is written at
+`from - rec.startFrame`, so the display and the audio share an origin only when
+`rec.startFrame === rec.startFramePredicted` — which, per the anchor defect
+above, is the case that does not happen. The waveform therefore disagrees with
+the audio by exactly the amount the anchor moved. Both must be derived from one
+value; see `ISSUE.md` 2.6.
 
 Stretching the captured fraction to full width instead re-scaled the whole
 picture on every block, which read as peaks arriving from the right and
