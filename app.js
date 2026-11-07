@@ -21,7 +21,7 @@ const EXPORT_TAIL = 1;           // seconds of reverb tail
 // ---------------------------------------------------------------------------
 
 const state = {
-  mode: "free",          // "free" | "tempo"
+  mode: "tempo",         // "free" | "tempo"
   bpm: 100,
   bars: 4,
   clickOn: true,
@@ -49,6 +49,7 @@ let armTimer = null;         // promotes an armed take at its loop boundary
 let nextBoundaryIndex = 0;   // next loop index to schedule
 let pendingRecord = null;    // { channel, startFrame, endFrame } while capturing
 let liveEnv = null;          // envelope of the take in progress, for the waveform
+let countInOscs = [];        // clicks of a count-in that has not finished yet
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -362,10 +363,12 @@ function onCaptureFrame(e) {
 
 function loopSamples() {
   if (state.mode === "tempo") {
-    // The seam fold shortens the take by n samples, so the grid uses the
-    // post-fold length. Everything downstream derives from this one value.
-    const raw = Math.round(state.bars * 4 * (60 / state.bpm) * ctx.sampleRate);
-    return raw - seamSamples(raw);
+    // The grid is the musical length, unshortened. Capture runs seamSamples(L)
+    // longer than this and foldSeam crossfades that extra tail into the head,
+    // so the buffer is exactly L samples and no audio is lost. Subtracting the
+    // seam here would make the loop 8 ms short of the bar grid and cut the
+    // tail of the last beat.
+    return Math.round(state.bars * 4 * (60 / state.bpm) * ctx.sampleRate);
   }
   return state.loopLength;
 }
@@ -512,6 +515,20 @@ function startArmTimer() {
   armTimer = setInterval(promoteArmed, LOOKAHEAD_MS);
 }
 
+// Beats left before an armed take punches in, for the button label. Counted in
+// beats rather than bars because a bar is 2.4 s at 100 BPM: a per-bar number
+// sits still long enough to look frozen. Free Mode has no beat grid, so the
+// count is in whole loops there. Returns 0 when nothing is armed.
+function armCountdown(ch) {
+  const rec = pendingRecord;
+  if (!rec || rec.channel !== ch || !ctx) return 0;
+  const remaining = rec.startTime - ctx.currentTime;
+  if (remaining <= 0) return 0;
+  const unit = state.mode === "tempo" ? 60 / state.bpm : loopSamples() / ctx.sampleRate;
+  if (!(unit > 0)) return 0;
+  return Math.max(1, Math.ceil(remaining / unit));
+}
+
 function stopArmTimer() {
   if (armTimer) {
     clearInterval(armTimer);
@@ -548,7 +565,25 @@ async function beginRecord(ch) {
   const ok = await ensureMic();
   if (!ok) return;
 
-  if (state.mode === "tempo") {
+  // A loop already exists: punch in at the loop top, in both modes. The take
+  // is armed now and capture opens at the next loop boundary, which is also
+  // loop sample 0, so what the user hears while recording is what plays back.
+  // The branch is loopLength, not mode: in Tempo Lock loopLength is what marks
+  // "a loop exists", and the grid is derived from BPM and bars.
+  if (state.loopLength) {
+    const L = state.loopLength;
+    const raw = L + seamSamples(L);
+    // If the transport is stopped, t0 is stale and there is no boundary to
+    // wait for: restart the loop from the top and record from there.
+    if (state.transport !== "running") {
+      startTransport(ctx.currentTime + 0.05);
+    }
+    const startAt = nextBoundaryTime(ctx.currentTime + 0.05);
+    armCapture(ch, startAt, startAt + raw / ctx.sampleRate, raw);
+    ch.state = "armed";
+    startArmTimer();
+  } else if (state.mode === "tempo") {
+    // First Tempo Lock take: count in, then start the transport on beat 5.
     const L = loopSamples();
     const raw = L + seamSamples(L);
     const beat = 60 / state.bpm;
@@ -557,31 +592,18 @@ async function beginRecord(ch) {
     const armAt = countInStart + 4 * beat;
     startTransport(armAt);
     state.loopLength = L;
-    // Capture the pre-fold length; foldSeam trims it back to L.
+    // Capture L + seam samples; foldSeam crossfades the extra tail into the
+    // head and returns exactly L, so the last beat is not cut.
     armCapture(ch, armAt, armAt + raw / ctx.sampleRate, raw);
-    ch.state = "recording";
+    // Armed through the count-in, promoted to RECORDING at beat 5, so the
+    // press can be cancelled before any audio is captured.
+    ch.state = "armed";
+    startArmTimer();
   } else {
-    if (state.loopLength) {
-      // Later track: punch in at the loop top. The take is armed now and
-      // capture begins at the next loop boundary, which is also sample 0 of
-      // the loop, so what the user hears while recording is what plays back.
-      const L = state.loopLength;
-      const raw = L + seamSamples(L);
-      // If the transport is stopped, t0 is stale and there is no boundary to
-      // wait for: restart the loop from the top and record from there.
-      if (state.transport !== "running") {
-        startTransport(ctx.currentTime + 0.05);
-      }
-      const startAt = nextBoundaryTime(ctx.currentTime + 0.05);
-      armCapture(ch, startAt, startAt + raw / ctx.sampleRate, raw);
-      ch.state = "armed";
-      startArmTimer();
-    } else {
-      // First take: free-running, length fixed at punch-out.
-      const startAt = ctx.currentTime + 0.05;
-      armCapture(ch, startAt, Infinity, 0);
-      ch.state = "recording";
-    }
+    // First Free Mode take: free-running, length fixed at punch-out.
+    const startAt = ctx.currentTime + 0.05;
+    armCapture(ch, startAt, Infinity, 0);
+    ch.state = "recording";
   }
   render();
 }
@@ -604,6 +626,8 @@ function armCapture(ch, startTime, endTime, lengthSamples) {
     // AudioContext time the capture window opens. An armed take waits for
     // this before it counts as recording.
     startTime,
+    // When the arm began, so the waveform can show the wait as a progress bar.
+    armedAt: ctx.currentTime,
     envTotal: 0,      // samples the live envelope currently spans
   };
   liveEnv = new Float32Array(WAVE_BUCKETS);
@@ -674,15 +698,16 @@ function finishCapture() {
     return;
   }
 
-  // In Tempo Lock the capture holds the pre-fold length, so fold all of it.
-  // In Free Mode the take is exactly what was recorded.
+  // In Tempo Lock the capture holds L + seam samples, so fold all of it back
+  // to L. In Free Mode the take is exactly what was recorded, and the fold
+  // trims its own tail.
   const captured = rec.freeMode ? length : Math.min(rec.scratch.length, length + seamSamples(length));
   const raw = rec.scratch.subarray(0, captured);
   const folded = foldSeam(raw);
   const buf = ctx.createBuffer(1, folded.length, rate);
   buf.getChannelData(0).set(folded);
 
-  // The seam fold shortens the loop; L is the post-fold length.
+  // The first Free Mode take defines the loop from its folded length.
   if (rec.freeMode) {
     state.loopLength = folded.length;
     startTransport(state.t0);
@@ -708,6 +733,17 @@ function punchOut(ch) {
       pendingRecord = null;
       liveEnv = null;
       stopArmTimer();
+    }
+    // A first Tempo Lock take is armed through its count-in, so cancelling it
+    // must also silence the clicks still queued and stop the transport that
+    // was started for it. A later take is armed against a loop that is already
+    // running: the master track keeps playing and only the take is dropped.
+    if (state.mode === "tempo") {
+      stopCountIn();
+      if (!state.channels.some((c) => c.buffer)) {
+        state.loopLength = 0;
+        stopTransport();
+      }
     }
     ch.state = "empty";
     render();
@@ -831,6 +867,12 @@ function clearChannel(ch) {
     } else {
       state.loopLength = remaining[0].buffer.length;
     }
+  } else if (!state.channels.some((c) => c.buffer)) {
+    // Tempo Lock: the grid is derived from BPM and bars, but loopLength is
+    // what marks "a loop exists". Clearing the last track must drop it, or the
+    // next record press would arm against a loop with nothing in it.
+    state.loopLength = 0;
+    stopTransport();
   }
   render();
 }
@@ -846,6 +888,18 @@ function playCountIn(startTime, beat) {
   }
 }
 
+// Cancels the clicks of a count-in that has not finished yet. Called when an
+// armed Tempo Lock take is cancelled, so the user is not left listening to a
+// count-in for a take that no longer exists.
+function stopCountIn() {
+  if (!countInOscs.length) return;
+  const now = ctx.currentTime;
+  for (const osc of countInOscs) {
+    try { osc.stop(now); } catch (_) {}
+  }
+  countInOscs.length = 0;
+}
+
 function playClick(when, accent) {
   const osc = ctx.createOscillator();
   const g = ctx.createGain();
@@ -857,6 +911,12 @@ function playClick(when, accent) {
   g.connect(clickGain);
   osc.start(when);
   osc.stop(when + 0.08);
+  // Track the click so a cancelled count-in can silence the ones still ahead.
+  countInOscs.push(osc);
+  osc.onended = () => {
+    const i = countInOscs.indexOf(osc);
+    if (i !== -1) countInOscs.splice(i, 1);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,6 +1101,27 @@ function drawWave(ch, canvas) {
     drawEnvelope(g, env, cssW, cssH, mid, color);
   }
 
+  // Armed: show the wait as a bar filling toward the punch-in, with the beat
+  // count on top. The waveform area is otherwise empty, so the countdown is
+  // the only thing telling the user when capture opens.
+  if (ch.state === "armed" && pendingRecord && pendingRecord.channel === ch) {
+    const rec = pendingRecord;
+    const total = rec.startTime - rec.armedAt;
+    const left = rec.startTime - ctx.currentTime;
+    const frac = total > 0 ? Math.max(0, Math.min(1, 1 - left / total)) : 1;
+    g.fillStyle = color;
+    g.fillRect(0, cssH - 3, cssW * frac, 3);
+
+    const count = armCountdown(ch);
+    if (count) {
+      g.fillStyle = color;
+      g.font = "600 13px system-ui, sans-serif";
+      g.textAlign = "center";
+      g.textBaseline = "middle";
+      g.fillText(`IN ${count}`, cssW / 2, mid);
+    }
+  }
+
   // Playhead during playback.
   if (state.transport === "running" && state.loopLength && ch.buffer) {
     const L = state.loopLength / ctx.sampleRate;
@@ -1071,13 +1152,18 @@ function startWaveLoop() {
   const tick = () => {
     waveRaf = requestAnimationFrame(tick);
     if (!ctx) return;
+    let armed = false;
     for (let i = 0; i < TRACK_COUNT; i++) {
       const ch = state.channels[i];
       const tile = el.tracks.children[i];
       if (!ch || !tile) continue;
+      if (ch.state === "armed") armed = true;
       const canvas = tile.querySelector("canvas.wave");
       if (canvas) drawWave(ch, canvas);
     }
+    // The countdown lives in the button label, which only render() writes, so
+    // an armed take needs a repaint per frame to tick. Nothing else does.
+    if (armed) render();
   };
   waveRaf = requestAnimationFrame(tick);
 }
@@ -1177,11 +1263,15 @@ function render() {
 
     const primary = tile.querySelector("[data-primary]");
     // A later Free Mode track cannot be punched out: its length is fixed by
-    // the first take, so the button only reports progress.
+    // the first take, so the button only reports progress. An armed take is
+    // always cancellable, in both modes.
     const locked = ch.state === "recording" && pendingRecord && !pendingRecord.freeMode;
+    // An armed take counts down to its punch-in, so the wait is legible
+    // instead of a dead press. Driven by the transport clock, not by audio.
+    const countdown = ch.state === "armed" ? armCountdown(ch) : 0;
     const labels = {
       empty: "RECORD",
-      armed: "ARMED",
+      armed: countdown ? `IN ${countdown}` : "ARMED",
       recording: locked ? "RECORDING…" : "STOP REC",
       playing: "OVERDUB",
       overdubbing: "STOP DUB",

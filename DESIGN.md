@@ -71,23 +71,37 @@ large touch/click targets on the primary buttons.
 ### 4.4 Count-in (Tempo Lock only)
 - On record press: 4 clicks at the chosen BPM — accented click on beat 1, softer clicks on 2, 3, 4.
 - The transport is (re)started at the end of the count-in: `t0` is set to the time of the 5th beat, which is beat 1 of the first recorded bar. This guarantees the recorded region is phase-aligned with the grid.
-- Recording arms at `t0`. Audio during the count-in is discarded.
+- Recording arms at `t0`. Audio during the count-in is discarded. The channel is `ARMED` through the count-in and promotes to `RECORDING` at beat 5, so the press can be cancelled before any audio is captured.
+- **Later tracks get no count-in.** Once a loop exists, a record press arms the take against the running grid and capture opens at the next loop boundary. The master track keeps playing throughout. See §4.5.
 - Recording auto-stops after exactly `L` samples; loop length is fixed regardless of button timing.
 - The click is synthesized into the master chain (see §4.6) and is never written into a track buffer and never included in export.
 
 ### 4.5 Channel states
 
-Per channel: `EMPTY → RECORDING → PLAYING → OVERDUBBING → PLAYING → …` plus `CLEARED` (which is `EMPTY` with the buffer discarded).
+Per channel: `EMPTY → ARMED → RECORDING → PLAYING → OVERDUBBING → PLAYING → …` plus `CLEARED` (which is `EMPTY` with the buffer discarded).
+
+`ARMED` is the wait for the punch-in point. It exists because a looper punches in **on the bar**: capture must open exactly at a loop boundary, not at the press. The wait is part of the instrument, so it is shown, not hidden.
 
 Primary button behavior, by current state:
 
 | State | Button label | Press action |
 |---|---|---|
-| EMPTY | RECORD | Start recording (Tempo Lock: count-in first) |
+| EMPTY | RECORD | Start recording (Tempo Lock first take: count-in first) |
+| ARMED | `IN n` (n = beats until punch-in) | Cancel the take, back to EMPTY |
 | RECORDING | STOP REC | Punch out (Tempo Lock: at next bar boundary; Free Mode: immediately, tail trimmed to `L`) |
 | PLAYING | OVERDUB | Start overdub at next loop boundary |
 | OVERDUBBING | STOP DUB | Punch out of overdub at next loop boundary; layer badge increments |
 | MUTED (any of the above) | same as underlying state | Mute does not change the primary action |
+
+**ARMED — the punch-in wait.** A record press on an empty track while a loop is already running does not start capture. The channel enters `ARMED` and capture opens at the next loop boundary, which is also loop sample 0, so what the user hears while recording is what plays back.
+
+- **The wait is legible.** The button counts down in **beats** until punch-in — `IN 16`, `IN 15`, … `IN 1` for a 4-bar loop at 4/4 — and the waveform area shows the same count. Beats rather than bars because a bar is 2.4 s at 100 BPM: a per-bar number sits still long enough to look frozen. At low BPM a beat is still slow, but it always moves. In Free Mode there is no beat grid, so the count is in whole loops (`IN 1`). There is no silent dead press.
+- **The press means cancel only while ARMED.** Pressing again before the boundary returns the channel to `EMPTY` and discards nothing (no audio was captured). Once the boundary passes and the state is `RECORDING`, the press is the punch-out action of that state, not a cancel.
+- **The label is driven by the transport clock, not by audio.** The state flips to `RECORDING` when `ctx.currentTime` reaches the punch-in time, on a 25 ms timer independent of the scheduler, so it still promotes if the transport is stopped underneath it. Keying off the first captured block would flip the label late and make the state invisible.
+- **Cancelling a Tempo Lock first take** also silences the count-in clicks still queued and stops the transport that was started for it. Cancelling a later take leaves the running loop untouched.
+- **If the transport is stopped** when a later track is armed, `t0` is stale and there is no boundary to wait for, so the transport is restarted first and the take arms against the new loop top.
+
+**Other transitions.**
 
 - **Record (empty track):** capture to the track's buffer; in Free Mode sets `L` and `t0`; in Tempo Lock auto-stops at `L`.
 - **Punch out:** as in the table. Free Mode punch-out is immediate and the take is trimmed to `L`; if the take is shorter than `L` it is rejected per §4.3.
@@ -122,7 +136,7 @@ Simplest workable model: **one buffer per channel, replaced at the loop boundary
 
 - The seam is fixed **once, destructively, at punch-out**, not at playback time.
 - Fold the last `N` samples of the take over the first `N` samples with an equal-power crossfade, `N = round(0.008 × sampleRate)` (8 ms). The result is a buffer of exactly `L` samples whose end and start match.
-- `L` is defined as the post-fold length. In Free Mode, `L` is the recorded length rounded to samples, then the fold is applied within it.
+- `L` is the musical loop length and is never shortened by the seam. In Tempo Lock `L = round(bars × 4 × 60 / BPM × sampleRate)`; capture runs `L + N` samples and the fold returns exactly `L`. In Free Mode, `L` is the recorded length rounded to samples, then the fold is applied within it.
 - Overdubs are summed into an already-seam-fixed buffer, so no further seam work is needed per layer.
 
 ### 4.9 Transport stop / resume (Space)
@@ -150,12 +164,13 @@ Simplest workable model: **one buffer per channel, replaced at the loop boundary
 1. First take on Track 1 in Free Mode defines loop length; Tracks 2–4 loop the same length in sync with no audible drift over 3+ minutes. Verified by recording a click on Track 1 and Track 2, exporting, and measuring the offset in samples (must be 0).
 2. In Tempo Lock at 100 BPM / 4 bars, pressing record plays a 4-click count-in, then records exactly `L` samples (460800 at 48 kHz, 423360 at 44.1 kHz) and auto-stops.
 3. Loop seam is inaudible (no click/pop) on all channels.
-4. Overdub on a channel preserves prior layers; layer badge increments; Clear (long-press) wipes it.
-5. Mute/unmute ramps at the next loop boundary with no click.
-6. Export produces a valid WAV containing the mix of all unmuted channels, with master volume applied and no click track.
-7. Keyboard shortcuts R, 1–4, Space work as described.
-8. App requests mic processing disabled and functions correctly on Chrome, Edge, Safari, Firefox desktop regardless of what the browser grants.
-9. Page loads and runs entirely client-side; no network calls after page load.
+4. A record press on an empty track while a loop runs shows a live beat countdown (`IN 16` … `IN 1` for a 4-bar loop), punches in exactly at the loop top, and can be cancelled by a second press at any point before that boundary. After the boundary the same press punches out instead of cancelling.
+5. Overdub on a channel preserves prior layers; layer badge increments; Clear (long-press) wipes it.
+6. Mute/unmute ramps at the next loop boundary with no click.
+7. Export produces a valid WAV containing the mix of all unmuted channels, with master volume applied and no click track.
+8. Keyboard shortcuts R, 1–4, Space work as described.
+9. App requests mic processing disabled and functions correctly on Chrome, Edge, Safari, Firefox desktop regardless of what the browser grants.
+10. Page loads and runs entirely client-side; no network calls after page load.
 
 ## 7. Suggested Milestones
 

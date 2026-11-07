@@ -114,21 +114,30 @@ needs no re-scheduling and restarting it at each boundary would cut the take.
 ### 3.3 Loop length and the seam fold
 
 Every take is captured **longer** than the loop by `seamSamples(L)` (8 ms, capped at
-`L/2`). `foldSeam()` crossfades the tail into the head and returns a buffer shortened
-by that amount, so the loop point is continuous in value — no click.
+`L/2`). `foldSeam()` crossfades that extra tail into the head and returns a buffer of
+exactly `L` samples, so the loop point is continuous in value — no click — and no audio
+is lost.
 
-Consequence: `loopSamples()` in Tempo Lock returns `raw - seamSamples(raw)`, i.e. the
-**post-fold** length. Everything downstream (scheduler, boundary math, export) derives
-from that one value. Do not "fix" the 8 ms discrepancy; it is intentional.
+Consequence: `loopSamples()` in Tempo Lock returns the **unshortened** musical grid,
+`bars × 4 × (60/BPM) × sampleRate`. Everything downstream (scheduler, boundary math,
+export) derives from that one value, and it equals the buffer length.
+
+**Do not subtract the seam from the grid.** That was the bug fixed on 2026-11-04: the
+grid was `raw - seamSamples(raw)` while the fold was handed a take of `raw` and returned
+`raw - seam`, so the buffer was 8 ms shorter than the material and the tail of the last
+beat was cut on every loop. At 100 BPM / 4 bars the loop ran 9.592 s against 9.600 s of
+audio. The grid must stay 9.600 s (460800 samples at 48 kHz) so the click stays on the
+beat and the last beat is heard.
 
 - **Free Mode, first take:** `armCapture(ch, startAt, Infinity, 0)` — free-running,
   length fixed at punch-out. `finishCapture` sets `state.loopLength` and back-dates
-  `state.t0` to the first captured frame.
+  `state.t0` to the first captured frame. Here the fold trims the take's own tail, so
+  `L` is the post-fold length by definition.
 - **Free Mode, later tracks:** punch in at the loop top (see §3.5). The take is armed
   immediately, capture opens at the next boundary, and the window is exactly `L + seam`.
   The take must match within `FREE_TOLERANCE` (50 ms) or it is rejected.
-- **Tempo Lock:** `L = bars × 4 × (60/BPM) × sampleRate`, minus the seam. 4 clicks of
-  count-in, capture arms on beat 5, auto-stops at the end of the window.
+- **Tempo Lock:** `L = bars × 4 × (60/BPM) × sampleRate`, no seam subtraction. 4 clicks
+  of count-in, capture arms on beat 5, auto-stops at the end of the `L + seam` window.
 
 ### 3.4 Capture path
 
@@ -145,6 +154,14 @@ boundary instead of a block late.
 `onCaptureFrame` copies the block into `pendingRecord.scratch` at
 `frame - startFrame`, tracks `lastFrame`, folds the block into `liveEnv` (see §4), and
 calls `finishCapture()` when the window is full.
+
+**`frame` is the render clock, not the mic clock.** The worklet stamps each block with
+the AudioContext frame it was *processed* at, but the samples inside it were captured
+`inputLatency` earlier (the device buffer: tens of ms on a wired mic, 100–300 ms on a
+phone or Bluetooth headset). Nothing compensates for that, so a take lands late by the
+input latency and plays back that much after the click. It is a constant offset, so it
+does not drift. DESIGN.md §6 "Latency compensation" specifies the fix; it is not
+implemented. If a take sounds late, suspect the input device before the code.
 
 ### 3.5 Channel states
 
