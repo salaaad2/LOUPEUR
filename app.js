@@ -349,9 +349,16 @@ function onCaptureFrame(e) {
   // before it are dropped and the take is anchored to the boundary itself.
   // The window is shifted back by the input latency, so the block that
   // carries the sound of the boundary is the one that opens the take.
+  //
+  // The anchor is the prediction, never the first block. The worklet delivers
+  // blocks on its own schedule, so the first one to arrive almost always starts
+  // after the prediction; anchoring there would discard the latency correction
+  // and slide the whole take, and the end with it. The samples between the two
+  // stay zero, which is correct: they are the pre-boundary audio the window was
+  // opened for.
   if (rec.startFrame === null) {
     if (frame + data.length <= rec.startFramePredicted) return;
-    rec.startFrame = Math.max(frame, rec.startFramePredicted);
+    rec.startFrame = rec.startFramePredicted;
     if (rec.endFrame !== Infinity) rec.endFrame = rec.startFrame + rec.lengthSamples;
   }
 
