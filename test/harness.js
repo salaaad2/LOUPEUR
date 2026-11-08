@@ -60,6 +60,17 @@ const EXPORTS = [
   "clearChannel",
   "stemFiles",
   "exportStems",
+  "channelAudible",
+  "seqStepAt",
+  "seqStepIndex",
+  "rampSeqGain",
+  "refreshSeqGates",
+  "toggleSeqRow",
+  "toggleSeqStep",
+  "setPlayMode",
+  "scheduleAhead",
+  "stopTransport",
+  "SEQ_STEPS",
 ];
 
 // Names are probed with typeof so the harness still loads against a version of

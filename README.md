@@ -2,8 +2,9 @@
 
 A looper pedal in the browser (Boss RC-505 mental model). Record up to four
 synced loop tracks from a microphone, overdub layers, mute and clear them, and
-export the mix as a WAV. Everything runs client-side; audio never leaves the
-machine. No build step, no dependencies, no backend.
+export the mix as a WAV. Copy a track to the sequencer to arrange it over a
+four-loop pattern. Everything runs client-side; audio never leaves the machine.
+No build step, no dependencies, no backend.
 
 ```
 index.html            static markup
@@ -38,6 +39,10 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | Track volume | Per-track level, applied to playback and to the export |
 | BPM / Bars | Tempo Lock grid: 60–180 BPM, 1/2/4/8 bars |
 | Mode | Free (first take sets the length) or Tempo Lock (grid + count-in) |
+| Playback mode (header) | `LOOP` plays every track every loop; `SEQUENCE` plays only the slots the grid has filled |
+| `COPY TO SEQ` | Adds the track to the sequencer as a row; press again to remove it |
+| Sequencer slot | One full loop. Click to fill (`X`) or empty it |
+| Loop pattern | On: the four slots repeat. Off: the pattern plays once and stops the transport |
 | Click track | Count-in and metronome, Tempo Lock only. Never recorded or exported |
 | Click while recording | Keeps the metronome ticking under a take, so you can play to the grid |
 | Microphone | Input picker; `Default input` follows the system default |
@@ -45,10 +50,10 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | Export Mix | Renders the unmuted tracks to a 16-bit stereo WAV |
 | Export tracks separately | One `track{n}.wav` per track that holds audio, into a folder you pick, or as downloads where the folder picker is unavailable |
 
-Keyboard: `R` record/punch on the selected track, `1`–`4` select a track,
-`Space` stop/resume.
+Keyboard: `R` record/punch on the selected track (LOOP mode only), `1`–`4`
+select a track, `Space` stop/resume.
 
-### The two modes
+### The two recording modes
 
 **Tempo Lock** (default) derives the loop length from BPM and bars. The first
 take gets a 4-beat count-in and records exactly one loop, then stops on its own.
@@ -57,6 +62,31 @@ Later takes punch in at the next loop boundary.
 **Free Mode** has no grid. The first take defines the loop length when you punch
 out; every later take must match it within 50 ms or it is rejected. Mode cannot
 be switched while any track holds audio or the transport runs.
+
+### LOOP and SEQUENCE
+
+The switch in the header is the playback mode, and it is independent of the
+recording mode above.
+
+**LOOP** is the original behaviour: every track plays every loop, and the
+sequencer grid is inert. You can still fill it; you just cannot hear it.
+
+**SEQUENCE** plays only what the grid says. A track with no row is silent and
+its tile is dimmed. A track with a row is heard on the slots that row has
+filled, and silent on the rest.
+
+A slot is one full loop, so a four-slot pattern is four loops long. The step
+clock is the transport clock divided by the loop length, which means the grid
+cannot drift against the audio. Filling the slot that is playing is heard
+immediately; a slot that is still ahead is picked up when its boundary arrives.
+
+`COPY TO SEQ` is a copy, not a move: the track keeps its audio, its level and
+its mute, and the row is a view of it. An overdub is heard through the row
+without copying again, and clearing the track drops the row with it.
+
+Recording is a LOOP mode action. In SEQUENCE mode the record button reads
+`LOOP ONLY`, because a take recorded there would be silent until it was copied
+to the grid.
 
 ### Why a record press sometimes waits
 
@@ -109,6 +139,18 @@ The stem tests cover the selection and the naming: one file per track that holds
 audio, numbered by track so an empty track leaves a gap, a muted track still
 gets a file, and the download fallback used where the folder picker is missing.
 
+The sequencer tests cover the step clock and the gate: a slot is one full loop,
+a time before the transport starts reads as the first slot, LOOP mode plays
+every track, SEQUENCE mode silences a track with no row, the gate follows the
+filled slots and repeats, the gate ramps on the boundary rather than mid-loop,
+a pattern that does not loop stops the transport after its last slot, copying
+and clearing a track add and drop its row, the mode switch waits for a live
+take, and the gate is a separate node so mute and volume keep their meaning.
+Three of them pin the timing hazards that made a track play on the wrong slot:
+a boundary that floors to the previous slot, a gate refresh that drops the
+boundary ramp the scheduler had queued, and a boundary the scheduler reached
+late.
+
 They assert internal consistency, not an absolute offset, which is why they hold
 on any device. Anything involving real capture, scheduling or rendering still
 needs a browser and a microphone.
@@ -126,6 +168,10 @@ needs a browser and a microphone.
   offset applies to every take on every track, including the first one, and the
   readout next to the Latency label always shows the number in force.
 - Export renders one loop plus a 1 s reverb tail, trimmed to the loop length.
+- **The export ignores the sequencer pattern.** `Export Mix` and the stems
+  render one loop of the tracks, not the four-loop arrangement: a track that
+  plays on slots 1 and 3 appears once in the file. The pattern is a playback
+  arrangement, not part of the material yet.
 - **Export tracks separately prefers a folder, and falls back to downloads.**
   The folder path uses the File System Access API (`showDirectoryPicker`).
   Firefox and Safari do not have it, and Brave turns it off by default

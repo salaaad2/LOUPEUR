@@ -76,6 +76,20 @@ body {
   white-space: nowrap;
 }
 
+/* The playback mode lives in the header, next to the badge, because it changes
+   what the whole page does: LOOP plays every track every loop, SEQUENCE plays
+   only the grid. */
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.play-mode .nb-button {
+  padding: 6px 12px;
+  font-size: 10px;
+}
+
 /* --------------------------------------------------------------------------
    Layout
    -------------------------------------------------------------------------- */
@@ -362,10 +376,10 @@ input.nb-checkbox:checked::before {
    so the four tracks are distinguishable at a glance. The transport states
    (armed / recording / playing / overdubbing) override it on the big button
    and the waveform, so a live state always reads louder than the track hue. */
-.track[data-index="0"] { --track: #83e28b; }
-.track[data-index="1"] { --track: #98bfe7; }
-.track[data-index="2"] { --track: #e6acec; }
-.track[data-index="3"] { --track: #c0f1ed; }
+.track[data-index="0"], .seq-row[data-index="0"] { --track: #83e28b; }
+.track[data-index="1"], .seq-row[data-index="1"] { --track: #98bfe7; }
+.track[data-index="2"], .seq-row[data-index="2"] { --track: #e6acec; }
+.track[data-index="3"], .seq-row[data-index="3"] { --track: #c0f1ed; }
 
 .track::before {
   content: "";
@@ -499,6 +513,22 @@ input.nb-checkbox:checked::before {
   color: #fff;
 }
 
+/* The copy button is a full-width row of its own, not a third button in the
+   foot: "COPY TO SEQ" does not fit in a third of a tile. */
+.seq-copy {
+  flex: none;
+  width: 100%;
+}
+
+.seq-copy.on {
+  background: var(--track);
+  color: var(--bg);
+}
+
+/* In SEQUENCE mode a track with no row is not played at all, so its tile is
+   dimmed: the waveform is still the material, but nothing is running. */
+.track.seq-silent { opacity: 0.5; }
+
 /* Per-track level. The slider is the same control as Master, so it keeps the
    global range styling; this row only lays out the label and the readout, and
    tints the thumb with the track hue so the four sliders read as four tracks.
@@ -536,6 +566,115 @@ input.nb-checkbox:checked::before {
   font-variant-numeric: tabular-nums;
   color: var(--track);
 }
+
+/* --------------------------------------------------------------------------
+   Sequencer
+   -------------------------------------------------------------------------- */
+
+/* .panel is a row; the sequencer stacks its head over its rows. */
+.sequencer {
+  flex-direction: column;
+  gap: 14px;
+}
+
+.seq-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.seq-title {
+  margin: 0;
+  font-family: var(--nb-font);
+  font-size: 13px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text);
+}
+
+.seq-loop {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--nb-font);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--dim);
+}
+
+.seq-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* The help line under the grid is a sentence, not a control caption, so it is
+   not held to the 220px the control help uses. */
+.sequencer .nb-help { max-width: none; }
+
+.seq-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.seq-name {
+  min-width: 84px;
+  font-family: var(--nb-font);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--track);
+}
+
+.seq-steps {
+  display: flex;
+  gap: 8px;
+}
+
+/* One slot is one full loop. Empty is a dark cell; filled is the track hue with
+   an X, so the pattern reads at a glance. */
+.seq-step {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 38px;
+  padding: 0;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  box-shadow: 3px 3px 0 var(--line);
+  background: var(--panel-2);
+  color: var(--dim);
+  font-family: var(--nb-font);
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, box-shadow 0.1s, transform 0.1s;
+}
+
+.seq-step:hover,
+.seq-step:focus {
+  box-shadow: 1px 1px 0 var(--line);
+  transform: translate(2px, 2px);
+}
+
+.seq-step.on {
+  background: var(--track);
+  color: var(--bg);
+}
+
+.seq-step.on::before { content: "X"; }
+
+/* The slot the transport is on. A white border, because the fill is already the
+   track hue and a second colour would read as a second state. */
+.seq-step.now { border-color: var(--text); }
 
 /* --------------------------------------------------------------------------
    Export
@@ -622,4 +761,7 @@ kbd {
   .tracks { grid-template-columns: 1fr; }
   .wrap { padding: 16px; }
   .header { margin: 16px 16px 0; padding: 14px 16px; flex-wrap: wrap; }
+  /* Four 46px slots plus the row name overflow a 320px screen. */
+  .seq-step { width: 38px; height: 34px; }
+  .seq-name { min-width: 64px; }
 }

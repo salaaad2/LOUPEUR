@@ -5,6 +5,7 @@
 // ---------------------------------------------------------------------------
 
 const TRACK_COUNT = 4;
+const SEQ_STEPS = 4;             // slots per sequencer row, one full loop each
 
 // Transport
 const LOOKAHEAD_MS = 25;         // scheduler tick
@@ -55,6 +56,12 @@ const state = {
   clickWhileRecording: false,  // metronome keeps ticking under a take
   reverbOn: false,
   master: 0.85,
+  // Playback mode. LOOP is the app's original behaviour: every track plays
+  // every loop and the grid is inert. SEQUENCE plays only the slots the grid
+  // has filled, and a track with no row is silent.
+  playMode: "loop",      // "loop" | "sequence"
+  seqLoop: true,         // pattern repeats; false stops the transport after the last slot
+  seqRows: new Array(TRACK_COUNT).fill(null),  // one row per copied track, by track index
   // Per-track level, 0..1, indexed by track. It lives here rather than on the
   // channel because the slider has to work before the audio graph exists: the
   // channels are created in initAudio(), and a level set before the first
@@ -112,6 +119,10 @@ const el = {
   calibrate: document.getElementById("calibrate"),
   offsetOut: document.getElementById("offsetOut"),
   offsetHelp: document.getElementById("offsetHelp"),
+  playMode: document.getElementById("playMode"),
+  seqRows: document.getElementById("seqRows"),
+  seqLoop: document.getElementById("seqLoop"),
+  seqHelp: document.getElementById("seqHelp"),
 };
 
 // ---------------------------------------------------------------------------
@@ -152,11 +163,18 @@ async function initAudio() {
     gain.gain.value = 1;
     gain.connect(dryGain);
     gain.connect(convolver);
+    // The sequencer gate sits in front of the channel gain, so mute and volume
+    // stay exactly what they were: the gate is a third, independent factor and
+    // the two existing ones are not rewritten to carry it.
+    const seqGain = ctx.createGain();
+    seqGain.gain.value = 1;
+    seqGain.connect(gain);
     state.channels.push({
       index: i,
       state: "empty",
       buffer: null,
       gain,
+      seqGain,
       source: null,
       muted: false,
       muteAt: 0,        // boundary a pending mute lands on, see toggleMute
@@ -857,6 +875,9 @@ function startTransport(atTime) {
   // Tracks that are already playing have no source after a stop; start them
   // now rather than waiting for the scheduler to reach a boundary.
   schedulePending();
+  // The gate is re-applied against the new t0: a track that was silent on the
+  // slot the transport stopped on must not stay silent on slot 0.
+  refreshSeqGates();
 }
 
 // Starts every playing/overdubbing track that has no source yet. Called when
@@ -940,9 +961,30 @@ function scheduleAhead() {
   const Lsec = L / ctx.sampleRate;
   if (!(Lsec > 0)) return;
 
+  // A pattern that does not loop ends at the boundary that closes its last
+  // slot. The gate has already ramped every track to silence there, so the
+  // stop cannot cut a tail; it only releases the sources.
+  if (!state.seqLoop && state.playMode === "sequence") {
+    if (ctx.currentTime >= state.t0 + SEQ_STEPS * Lsec) {
+      stopTransport();
+      render();
+      return;
+    }
+  }
+
   let guard = 0;
   while (state.t0 + nextBoundaryIndex * Lsec < horizon && guard++ < 64) {
     const when = state.t0 + nextBoundaryIndex * Lsec;
+    // The gate is a per-boundary decision: the slot changes here, so every
+    // track's level is re-evaluated at the instant the loop turns over. A
+    // boundary the scheduler reached late still gets its gate: rampSeqGain
+    // applies it at `now` rather than leaving the previous slot's value in
+    // place for a whole slot.
+    if (state.playMode === "sequence") {
+      for (const ch of state.channels) {
+        if (ch.buffer) rampSeqGain(ch, when);
+      }
+    }
     if (when >= ctx.currentTime - 0.01) {
       for (const ch of state.channels) {
         if (ch.state !== "playing" && ch.state !== "overdubbing") continue;
@@ -1061,7 +1103,7 @@ function scheduleChannel(ch, when, offsetSamples) {
   }
   const src = ctx.createBufferSource();
   src.buffer = ch.buffer;
-  src.connect(ch.gain);
+  src.connect(ch.seqGain);
   // A source entered mid-loop plays the remainder of the buffer and then
   // loops from its head, so the track stays aligned with the transport.
   src.loop = true;
@@ -1072,6 +1114,133 @@ function scheduleChannel(ch, when, offsetSamples) {
     if (ch.source === src) ch.source = null;
   };
   ch.source = src;
+}
+
+// ---------------------------------------------------------------------------
+// Sequencer
+// ---------------------------------------------------------------------------
+
+// The step the transport is on at `when`, counted in whole loops from t0. Not
+// wrapped: the caller wraps it for the pattern and compares it against
+// SEQ_STEPS to find the end of a pattern that does not loop.
+function seqStepAt(when) {
+  if (!ctx) return 0;
+  const L = loopSamples() / ctx.sampleRate;
+  if (!(L > 0)) return 0;
+  // A boundary is t0 + n * L, and floating point can leave (when - t0) / L a
+  // hair below n. Flooring that reads the previous slot at the boundary, which
+  // is a whole slot of the wrong gate. The epsilon is far below one sample and
+  // far above the rounding error.
+  return Math.floor((when - state.t0) / L + 1e-9);
+}
+
+// The slot a time falls in, 0..SEQ_STEPS-1. Clamped at zero so a time before
+// t0 (a transport that has not started yet) reads as the first slot instead of
+// wrapping to the last one.
+function seqStepIndex(when) {
+  return Math.max(0, seqStepAt(when)) % SEQ_STEPS;
+}
+
+// True when a channel should be heard at `when`.
+//
+// LOOP mode is the app's original behaviour: every track plays every loop, and
+// the grid is inert. SEQUENCE mode is the arrangement: a track is heard only on
+// the slots its row has filled, and a track with no row is silent.
+//
+// A stopped transport answers true. Nothing is playing, so the gate only has to
+// be right once the transport starts, and startTransport re-applies it there.
+// Reading a stale t0 instead would gate a track off before the first boundary.
+function channelAudible(ch, when) {
+  if (state.playMode === "loop") return true;
+  if (state.transport !== "running") return true;
+  const row = state.seqRows[ch.index];
+  if (!row) return false;
+  const n = seqStepAt(when);
+  if (!state.seqLoop && n >= SEQ_STEPS) return false;
+  return row.steps[seqStepIndex(when)];
+}
+
+// The sequencer gate for one channel, ramped at `when`. Same shape as
+// rampChannelGain: hold the current value, then ramp, so a slot change is a
+// 10 ms fade rather than a click.
+function rampSeqGain(ch, when) {
+  if (!ctx || !ch.seqGain) return;
+  const now = ctx.currentTime;
+  const at = Math.max(when, now);
+  const g = ch.seqGain.gain;
+  // Cancel from the boundary, not from now: an immediate ramp that
+  // refreshSeqGates queued for the slot that is playing must survive.
+  g.cancelScheduledValues(at);
+  g.setValueAtTime(g.value, now);
+  if (at > now) g.setValueAtTime(g.value, at);
+  g.linearRampToValueAtTime(channelAudible(ch, at) ? 1 : 0, at + RAMP_SECONDS);
+}
+
+// Re-applies every gate at `when` (now by default). Called whenever the thing
+// the gate depends on changes: the mode, a slot, a row, a committed take.
+//
+// The next boundary is re-scheduled in the same pass. A plain rampSeqGain call
+// here would cancel the boundary ramp scheduleAhead had already queued, and
+// nextBoundaryIndex has moved past it, so nothing would put it back: the gate
+// would then hold the current slot's value for a whole extra slot.
+function refreshSeqGates(when) {
+  if (!ctx) return;
+  const now = when === undefined ? ctx.currentTime : when;
+  const next = nextBoundaryTime(now);
+  for (const ch of state.channels) {
+    if (!ch.buffer) continue;
+    const g = ch.seqGain.gain;
+    const here = channelAudible(ch, now) ? 1 : 0;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(here, now + RAMP_SECONDS);
+    if (next > now) {
+      const there = channelAudible(ch, next) ? 1 : 0;
+      g.setValueAtTime(here, next);
+      g.linearRampToValueAtTime(there, next + RAMP_SECONDS);
+    }
+  }
+}
+
+// Adds or removes a track's row. The row is a view of the track, not a copy of
+// its samples: an overdub is heard through the row without copying again, and
+// clearing the track drops the row with it.
+function toggleSeqRow(i) {
+  const ch = state.channels[i];
+  if (!ch || !ch.buffer) return;
+  state.seqRows[i] = state.seqRows[i]
+    ? null
+    : { steps: new Array(SEQ_STEPS).fill(false) };
+  refreshSeqGates();
+  render();
+}
+
+// Fills or empties one slot. The gate for the slot that is playing right now
+// changes with the click, so it is applied now: waiting a whole pattern to hear
+// a cell you just filled reads as broken. A slot that is not playing yet is
+// picked up by the boundary scheduler when its turn comes.
+function toggleSeqStep(i, step) {
+  const row = state.seqRows[i];
+  if (!row || step < 0 || step >= SEQ_STEPS) return;
+  row.steps[step] = !row.steps[step];
+  refreshSeqGates();
+  render();
+}
+
+// The playback mode. A take in progress owns the transport, so the switch waits
+// for it: changing what the tracks are gated by under a live take would make
+// the take's own monitoring disagree with what it records.
+function setPlayMode(mode) {
+  if (mode !== "loop" && mode !== "sequence") return;
+  if (state.playMode === mode) return;
+  if (takeInProgress()) {
+    showBanner("Finish or cancel the take before switching playback mode.");
+    return;
+  }
+  state.playMode = mode;
+  refreshSeqGates();
+  schedulePending();
+  render();
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,6 +1407,7 @@ function finishCapture() {
       ch.source = null;
     }
     schedulePending();
+    refreshSeqGates();
     render();
     return;
   }
@@ -1285,6 +1455,7 @@ function finishCapture() {
   // schedulePending enters at `max(now, t0)` with the offset the transport has
   // reached, which is the same rule a stop/start and an overdub use.
   schedulePending();
+  refreshSeqGates();
   render();
 }
 
@@ -1450,9 +1621,16 @@ function clearChannel(ch) {
   ch.muteAt = 0;
   ch.envBuffer = null;
   ch.env = null;
+  // The row is a view of the track, so it goes with it.
+  state.seqRows[ch.index] = null;
   const g = ch.gain.gain;
   g.cancelScheduledValues(ctx.currentTime);
   g.setValueAtTime(channelTarget(ch), ctx.currentTime);
+  // The gate is reset too, so a track recorded again does not inherit the
+  // silence of the slot it was cleared on.
+  const sg = ch.seqGain.gain;
+  sg.cancelScheduledValues(ctx.currentTime);
+  sg.setValueAtTime(1, ctx.currentTime);
 
   // loopLength is what marks "a loop exists" in both modes, so it has to follow
   // the buffers. In Free Mode the surviving tracks define the length; in Tempo
@@ -1827,7 +2005,9 @@ function drawWave(ch, canvas) {
 
   // Playhead during playback. Measured against the buffer's own length, the
   // same length the source loops on, so it sits where the audio actually is.
-  if (state.transport === "running" && ch.buffer) {
+  // A gated-off track has no playhead: it is not playing, and a moving line
+  // over a silent track would say it was.
+  if (state.transport === "running" && ch.buffer && channelAudible(ch, ctx.currentTime)) {
     const L = ch.buffer.length / ctx.sampleRate;
     const pos = (((ctx.currentTime - state.t0) % L) + L) % L / L;
     g.strokeStyle = "rgba(255,255,255,0.55)";
@@ -1890,6 +2070,7 @@ function startWaveLoop() {
     }
     // The countdown lives in the button label, which only render() writes, so
     // an armed take needs a repaint per frame to tick. Nothing else does.
+    updateSeqPlayhead();
     if (armed) render();
   };
   waveRaf = requestAnimationFrame(tick);
@@ -1920,7 +2101,8 @@ function buildTracks() {
       <div class="track-foot">
         <button type="button" class="small nb-button" data-mute="${i}">MUTE</button>
         <button type="button" class="small nb-button" data-clear="${i}">CLEAR</button>
-      </div>`;
+      </div>
+      <button type="button" class="small nb-button seq-copy" data-seq="${i}">COPY TO SEQ</button>`;
     el.tracks.appendChild(tile);
   }
 
@@ -1929,6 +2111,7 @@ function buildTracks() {
     if (t.dataset.primary !== undefined) onPrimary(Number(t.dataset.primary));
     else if (t.dataset.mute !== undefined) onMute(Number(t.dataset.mute));
     else if (t.dataset.clear !== undefined) onClear(Number(t.dataset.clear));
+    else if (t.dataset.seq !== undefined) toggleSeqRow(Number(t.dataset.seq));
   });
 
   el.tracks.addEventListener("input", (e) => {
@@ -1974,6 +2157,12 @@ function bindClearHold() {
 
 async function onPrimary(i) {
   await initAudio();
+  // The button is disabled in SEQUENCE mode, but the R shortcut reaches this
+  // directly, so the guard has to live here too.
+  if (state.playMode === "sequence") {
+    showBanner("Recording is a LOOP mode action. Switch to LOOP to record.");
+    return;
+  }
   const ch = state.channels[i];
   state.selected = i;
 
@@ -1993,6 +2182,97 @@ function onMute(i) {
 function onClear(i) {
   if (!ctx) return;
   clearChannel(state.channels[i]);
+}
+
+// ---------------------------------------------------------------------------
+// Sequencer UI
+// ---------------------------------------------------------------------------
+
+// Rebuilds the rows from state. Called only when the set of rows changes, so a
+// per-frame render does not throw away the buttons under the pointer.
+function buildSeqRows() {
+  const html = [];
+  for (let i = 0; i < TRACK_COUNT; i++) {
+    const row = state.seqRows[i];
+    if (!row) continue;
+    const steps = row.steps
+      .map(
+        (on, s) =>
+          `<button type="button" class="seq-step${on ? " on" : ""}" data-seqrow="${i}" data-step="${s}" aria-pressed="${on}" aria-label="Track ${i + 1} slot ${s + 1}"></button>`
+      )
+      .join("");
+    html.push(
+      `<div class="seq-row" data-row="${i}" data-index="${i}">` +
+        `<span class="seq-name">Track ${i + 1}</span>` +
+        `<div class="seq-steps">${steps}</div>` +
+        `</div>`
+    );
+  }
+  el.seqRows.innerHTML = html.join("");
+}
+
+let seqSignature = "";
+
+function renderSequencer() {
+  const sig = state.seqRows.map((r) => (r ? "1" : "0")).join("");
+  if (sig !== seqSignature) {
+    seqSignature = sig;
+    buildSeqRows();
+  }
+  for (let i = 0; i < TRACK_COUNT; i++) {
+    const row = state.seqRows[i];
+    if (!row) continue;
+    const rowEl = el.seqRows.querySelector(`[data-row="${i}"]`);
+    if (!rowEl) continue;
+    const steps = rowEl.querySelectorAll(".seq-step");
+    for (let s = 0; s < SEQ_STEPS; s++) {
+      const btn = steps[s];
+      if (!btn) continue;
+      btn.classList.toggle("on", row.steps[s]);
+      btn.setAttribute("aria-pressed", String(row.steps[s]));
+    }
+  }
+  el.seqHelp.textContent = seqHelpText();
+}
+
+function seqHelpText() {
+  if (!state.seqRows.some(Boolean)) {
+    return "Copy a track to the sequencer, then fill the slots.";
+  }
+  if (state.playMode === "loop") {
+    return "Inactive in LOOP mode. Switch the header to SEQUENCE to hear the grid.";
+  }
+  return "Click a slot to fill it. Each slot is one full loop.";
+}
+
+// The slot the transport is on, marked on every row. Only the change is
+// written, so a per-frame call costs nothing while the slot holds.
+let seqPlayhead = -1;
+
+function updateSeqPlayhead() {
+  if (!ctx || state.playMode !== "sequence" || state.transport !== "running") {
+    if (seqPlayhead !== -1) {
+      seqPlayhead = -1;
+      markSeqPlayhead(-1);
+    }
+    return;
+  }
+  const step = seqStepIndex(ctx.currentTime);
+  if (step === seqPlayhead) return;
+  seqPlayhead = step;
+  markSeqPlayhead(step);
+}
+
+function markSeqPlayhead(step) {
+  for (let i = 0; i < TRACK_COUNT; i++) {
+    if (!state.seqRows[i]) continue;
+    const rowEl = el.seqRows.querySelector(`[data-row="${i}"]`);
+    if (!rowEl) continue;
+    const steps = rowEl.querySelectorAll(".seq-step");
+    for (let s = 0; s < steps.length; s++) {
+      steps[s].classList.toggle("now", s === step);
+    }
+  }
 }
 
 function render() {
@@ -2019,9 +2299,12 @@ function render() {
       playing: "OVERDUB",
       overdubbing: locked ? "DUBBING…" : "STOP DUB",
     };
-    primary.textContent = labels[ch.state] || "RECORD";
+    // Recording is a LOOP mode action: a take recorded in SEQUENCE mode would
+    // be silent until it was copied to the grid, which reads as a broken take.
+    const seqOnly = state.playMode === "sequence";
+    primary.textContent = seqOnly ? "LOOP ONLY" : labels[ch.state] || "RECORD";
     primary.dataset.state = ch.state;
-    primary.disabled = Boolean(locked);
+    primary.disabled = Boolean(locked) || seqOnly;
 
     const mute = tile.querySelector("[data-mute]");
     mute.classList.toggle("latched", ch.muted);
@@ -2029,6 +2312,22 @@ function render() {
     const layers = tile.querySelector("[data-layers]");
     layers.textContent = ch.layers;
     layers.classList.toggle("show", ch.layers > 0);
+
+    const seqBtn = tile.querySelector("[data-seq]");
+    if (seqBtn) {
+      const inSeq = Boolean(state.seqRows[i]);
+      seqBtn.classList.toggle("on", inSeq);
+      seqBtn.textContent = inSeq ? "IN SEQ" : "COPY TO SEQ";
+      seqBtn.disabled = !ch.buffer;
+    }
+
+    // In SEQUENCE mode a track with no row is not played at all, so its tile is
+    // dimmed: the waveform is still the material, but nothing is running.
+    tile.classList.toggle("seq-silent", state.playMode === "sequence" && !state.seqRows[i]);
+  }
+
+  for (const b of el.playMode.children) {
+    b.classList.toggle("on", b.dataset.playmode === state.playMode);
   }
 
   const hasAudio = state.channels.some((c) => c.buffer);
@@ -2056,6 +2355,8 @@ function render() {
     state.mode === "free"
       ? "Free Mode: the first take sets the loop length. Later tracks must match it."
       : `Tempo Lock: ${state.bars} bar${state.bars > 1 ? "s" : ""} at ${state.bpm} BPM. Recording snaps to the grid.`;
+
+  renderSequencer();
 }
 
 function showBanner(msg) {
@@ -2092,6 +2393,23 @@ function bindControls() {
     state.mode = btn.dataset.mode;
     for (const b of el.mode.children) b.classList.toggle("on", b === btn);
     render();
+  });
+
+  el.playMode.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-playmode]");
+    if (!btn) return;
+    setPlayMode(btn.dataset.playmode);
+  });
+
+  el.seqLoop.addEventListener("change", () => {
+    state.seqLoop = el.seqLoop.checked;
+    render();
+  });
+
+  el.seqRows.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-seqrow]");
+    if (!btn) return;
+    toggleSeqStep(Number(btn.dataset.seqrow), Number(btn.dataset.step));
   });
 
   el.click.addEventListener("change", () => {

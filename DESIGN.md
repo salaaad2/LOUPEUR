@@ -78,6 +78,72 @@ three agree.
 and re-enters it at the wrong offset. `scheduleChannel` clears `ch.source` in
 `onended`, so a source that stopped on its own is treated as pending again.
 
+## The sequencer is a gate, not a second clock
+
+A slot is one full loop, so the step is `floor((now − t0) / L) mod 4`. There is
+no second timer: the grid is read off the transport clock, which is the only
+clock the audio is scheduled on. A separate interval would drift against the
+loop, and the drift would be audible as a track entering a few milliseconds
+late on every pass.
+
+The gate is a `seqGain` node in front of the channel gain:
+
+```
+buffer → BufferSource → seqGain (sequencer) → gain (mute × volume) → dry/reverb
+```
+
+It is a **third, independent factor**, not a third term in `channelTarget()`.
+Folding it into the channel gain would have made "the channel gain is mute times
+volume" false, and the level tests exist to keep that true. The gate is ramped
+with the same hold-then-ramp shape as `rampChannelGain`, so a slot change is a
+10 ms fade rather than a click.
+
+The gate is re-evaluated at every loop boundary by `scheduleAhead()`, which
+already walks the boundaries for the sources. That is the whole scheduler
+change: one `rampSeqGain` per track per boundary, in SEQUENCE mode only.
+
+`channelAudible()` is the single place that decides what a mode means:
+
+- LOOP: every track, every loop. The grid is inert.
+- SEQUENCE: a track with no row is silent; a track with a row is heard on the
+  slots it has filled.
+- A stopped transport answers true. Nothing is playing, so the gate only has to
+  be right once the transport starts, and `startTransport()` re-applies it
+  against the new `t0`. Reading a stale `t0` would gate a track off before the
+  first boundary.
+
+`seqStepIndex()` clamps at zero before wrapping. A time before `t0` is a
+negative step, and `-1 % 4` is `-1`, which would read as the last slot instead
+of the first.
+
+Two things about that clock are easy to get wrong, and both were audible as a
+track playing on the wrong slot:
+
+- A boundary is `t0 + n·L`, and floating point can leave `(when − t0) / L` a
+  hair below `n`. A plain floor then reads the previous slot at the boundary,
+  which is a whole slot of the wrong gate. `seqStepAt()` adds a `1e-9` epsilon,
+  far below one sample and far above the rounding error.
+- The gate has two writers: `scheduleAhead()` queues the next boundary, and
+  `refreshSeqGates()` re-applies the current slot when the mode, a slot, a row
+  or a take changes. A `cancelScheduledValues(now)` in the second writer wipes
+  the boundary the first one queued, and `nextBoundaryIndex` has already moved
+  past it, so nothing puts it back. `refreshSeqGates()` therefore re-schedules
+  the next boundary in the same pass, and `rampSeqGain()` cancels from the
+  boundary rather than from `now`, so an immediate ramp survives.
+
+A pattern that does not loop ends at `t0 + 4L`. The gate has already ramped
+every track to silence at that boundary, so `stopTransport()` cannot cut a tail;
+it only releases the sources.
+
+The row is a **view** of the track, not a copy of its samples. An overdub is
+heard through the row without copying again, and `clearChannel()` drops the row
+with the track. A snapshot would go stale the moment the track was overdubbed,
+and nothing in the UI would say so.
+
+Recording is a LOOP mode action. A take recorded in SEQUENCE mode would be
+silent until it was copied to the grid, which reads as a broken take, so the
+button is disabled and `onPrimary()` refuses the `R` shortcut too.
+
 ## Capture is anchored to a predicted frame, not the first block
 
 `armCapture` stores `startFramePredicted = round(startTime × sampleRate)`, shifted
@@ -275,6 +341,12 @@ first take in either mode and dropped when the last track is cleared. In Tempo
 Lock the grid is derived from BPM and bars, but the flag still has to follow the
 buffers or the next record press arms against a loop with nothing in it.
 
+`state.playMode` is the playback mode, not the recording mode: `"loop"` or
+`"sequence"`. `state.seqRows` is a sparse array indexed by track, holding
+`{ steps }` for a copied track and `null` for one that was never copied. It is
+indexed by track rather than kept as a list so the gate lookup is one array
+index, and so a row cannot outlive the track it belongs to.
+
 `pendingRecord.definesLoop` is true only for the first Free Mode take, which
 defines the loop length instead of matching it. `isLockedTake()` is the single
 place that decides whether a take can be punched out; `render()` and `punchOut()`
@@ -334,10 +406,10 @@ box while the writes are in flight.
 ```
 mic → AudioWorklet capture → ring buffer → track buffers (never to destination)
 
-track buffer → BufferSource → channel Gain (mute × volume) ─┐
-                                                            ├→ master Gain → dry ──────────────┐
-click synth ────────────────────────────────────────────────┤                                  ├→ destination
-                                                            └→ reverb send → convolver → wet ─┘
+track buffer → BufferSource → seqGain (sequencer) → channel Gain (mute × volume) ─┐
+                                                                                 ├→ master Gain → dry ──────────────┐
+click synth ─────────────────────────────────────────────────────────────────────┤                                  ├→ destination
+                                                                                 └→ reverb send → convolver → wet ─┘
 ```
 
 The click enters after the channel gains and before master, so it is audible but
@@ -354,3 +426,5 @@ node disconnect, so toggling never clicks.
   50 ms or it is rejected.
 - **No punch-out of a fixed-length take.** A later Free Mode track and an overdub
   both run to the end of the loop.
+- **No pattern export.** The export renders one loop of the tracks, not the
+  four-loop arrangement. The pattern is a playback arrangement, not material.
