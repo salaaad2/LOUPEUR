@@ -79,7 +79,7 @@ context with a stubbed DOM and Web Audio API and hands back the internals a test
 needs to drive capture directly, so the audio math (loop length, seam fold,
 boundary and offset arithmetic, envelope) runs in Node.
 
-The capture tests assert three properties that do not depend on knowing the true
+The capture tests assert four properties that do not depend on knowing the true
 latency of the hardware:
 
 1. **The anchor is honoured.** Blocks that start after the prediction do not move
@@ -88,12 +88,16 @@ latency of the hardware:
    commits, including when the take ends on a block boundary.
 3. **The display agrees with the audio.** The buffer index of a peak and the x
    position the waveform gives that sample refer to the same fraction of the take.
+4. **A committed take enters at the loop top.** The source starts at the position
+   the transport has reached, with the offset converted to the seconds `start()`
+   wants, so a track recorded over a running loop is not left behind the one it
+   was played against.
 
 The calibration tests cover the measurement itself: a known round trip comes back
-as that round trip, silence is reported as no measurement rather than as zero, a
-louder noise after the click does not move the result, calibration and the slider
-write the same per-device number, the slider shows the number in force, and the
-sync check corrects a late take by the amount it is late.
+as that round trip, silence is reported as no measurement rather than as zero,
+one bad burst does not move the robust estimate, calibration and the slider write
+the same per-device number, the slider shows the number in force, and the sync
+check corrects a short offset by the amount it is short.
 
 They assert internal consistency, not an absolute offset, which is why they hold
 on any device. Anything involving real capture, scheduling or rendering still

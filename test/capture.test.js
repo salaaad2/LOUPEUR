@@ -5,13 +5,12 @@
 // offset. They are the tests that would have caught the reported bug on every
 // version of the code so far.
 //
-// The model they encode. The capture window opens `shift` samples before the
-// boundary, and `shift` is the whole round trip: the player hears the transport
-// `outputLatency` late and therefore plays that much late, and the mic stamps
-// the sound `inputLatency` later again. So the audio of a note the player meant
-// for render frame `f` is stamped at `f + 2 * shift`, and the window -- which
-// opens at `boundary - shift` -- holds it at scratch index `shift`. `shift` is
-// whatever the code computes; the tests read it back from the pending record
+// The model they encode. `shift` is the whole round trip: the player hears the
+// transport `outputLatency` late and therefore plays that much late, and the
+// mic stamps the sound `inputLatency` later again. So the audio of a note the
+// player meant for render frame `f` is stamped at `f + shift`, and the window
+// -- which opens at `boundary + shift` -- holds it at scratch index 0. `shift`
+// is whatever the code computes; the tests read it back from the pending record
 // instead of assuming a value.
 
 const assert = require("assert");
@@ -42,7 +41,7 @@ async function armedTake(opts) {
 // `f`. The player hears the transport `shift` late and plays that much late; the
 // mic then stamps the result `shift` later again.
 function playedAt(rec, f) {
-  return f + 2 * rec.shift;
+  return f + rec.shift;
 }
 
 // Feeds one block of silence, optionally with a click at a given mic frame.
@@ -115,18 +114,18 @@ tests.push({
     const { t, rec, startTime } = await armedTake();
     const boundary = Math.round(startTime * RATE);
     assert.strictEqual(rec.boundaryFrame, boundary, "the record lost its boundary");
-    // The window opens `shift` before the boundary, and the audio of the
+    // The window opens `shift` after the boundary, and the audio of the
     // boundary is stamped `shift` after it, so the two meet at scratch index 0.
     assert.strictEqual(
       rec.startFramePredicted,
-      boundary - rec.shift,
-      "the window does not open a shift before the boundary"
+      boundary + rec.shift,
+      "the window does not open a shift after the boundary"
     );
     const clickMic = playedAt(rec, boundary);
     assert.strictEqual(
       clickMic,
-      rec.startFramePredicted + rec.shift,
-      "the boundary's audio is not a shift into the window"
+      rec.startFramePredicted,
+      "the boundary's audio is not at the head of the window"
     );
     // The block carrying the click is the one that opens the window, so the
     // feed has to start there: a click the worklet never delivers is not a
@@ -205,12 +204,12 @@ tests.push({
     for (let i = 0; i < data.length; i++) {
       if (Math.abs(data[i]) > Math.abs(data[peak])) peak = i;
     }
-    // The take starts at scratch index `shift`, so the position of the peak
-    // within the take is measured from there. The take is `lengthSamples` long,
-    // which is the loop plus its seam tail, not the loop: the canvas spans the
-    // take, so the fraction has to be taken against the same length.
+    // The take starts at scratch index 0, so the position of the peak within
+    // the take is its scratch index. The take is `lengthSamples` long, which is
+    // the loop plus its seam tail, not the loop: the canvas spans the take, so
+    // the fraction has to be taken against the same length.
     const take = rec.lengthSamples;
-    const audioFrac = (peak - rec.shift) / take;
+    const audioFrac = peak / take;
 
     // Redraw the live waveform from the envelope the capture built, with the
     // take still open so drawWave takes the recording branch.
@@ -265,9 +264,81 @@ tests.push({
       Math.round(0.24 * RATE),
       "the stored round trip did not replace the estimate"
     );
-    // The window still opens a shift before the boundary, so the audio of the
+    // The window opens a shift after the boundary, so the audio of the
     // boundary lands at scratch index 0 whatever the number is.
-    assert.strictEqual(rec.startFramePredicted, rec.boundaryFrame - rec.shift);
+    assert.strictEqual(rec.startFramePredicted, rec.boundaryFrame + rec.shift);
+  },
+});
+
+// A take recorded over an existing loop is entered at the loop position the
+// transport has reached, not at the boundary it was recorded from. That boundary
+// is always in the past by the time the take commits -- the window opens at
+// `boundary + shift` and runs the take, the seam and CAPTURE_SLACK -- so
+// starting at it clamps to "now" and plays the buffer from its head at whatever
+// phase the loop happens to be at. Every track recorded over a loop landed
+// `shift + seam + CAPTURE_SLACK` behind the one it was played against, which is
+// the "track 2 is late" report.
+tests.push({
+  name: "entry: a committed take starts at the loop position the transport reached",
+  async fn() {
+    const t = load({ sampleRate: RATE });
+    await boot(t);
+    t.state.mode = "tempo";
+    t.state.bpm = 100;
+    t.state.bars = 1;
+    const L = t.loopSamples();
+    t.state.loopLength = L;
+    // Track 2, over a loop track 1 already defined.
+    const ch = t.state.channels[1];
+    const t0 = 1;
+    t.startTransport(t0);
+    t.__ctx.__clock.now = t0 + 0.1;
+    t.armTake(ch, t.nextBoundaryTime(t.__ctx.__clock.now + 0.05), L);
+    const rec = t.pendingRecord;
+
+    // A click the player meant for render frame `boundary + 10000`, so it
+    // belongs at buffer index 10000.
+    const want = 10000;
+    const clickAt = rec.boundaryFrame + rec.shift + want;
+    for (let frame = rec.startFramePredicted; frame < rec.stopFrame + BLOCK; frame += BLOCK) {
+      const data = new Float32Array(BLOCK);
+      if (clickAt >= frame && clickAt < frame + BLOCK) data[clickAt - frame] = 1;
+      // The clock has to move with the feed: the entry is computed from
+      // `currentTime` at the moment the take commits.
+      t.__ctx.__clock.now = frame / RATE;
+      t.onCaptureFrame({ data: { frame, data } });
+      if (!t.pendingRecord) break;
+    }
+
+    assert.ok(ch.buffer, "the take never finished");
+    assert.strictEqual(
+      ch.buffer.getChannelData(0)[want],
+      1,
+      "the click is not at its own index in the committed buffer"
+    );
+
+    const src = ch.source;
+    assert.ok(src, "the committed take was never entered");
+    const s = src.started[src.started.length - 1];
+    // `start()` takes the offset in seconds. A sample count passed straight
+    // through is larger than the buffer duration, which the API clamps to the
+    // end of the buffer: the source then starts at its head at `when` instead of
+    // at the phase `when` represents.
+    assert.ok(
+      s.offset >= 0 && s.offset < ch.buffer.duration,
+      `the offset passed to start() is ${s.offset}, not a position in the buffer`
+    );
+    // Buffer index 0 has to land on a loop boundary: the phase the source
+    // starts at, minus the offset it starts into the buffer, is a multiple of
+    // the loop length.
+    const phase =
+      Math.round((Math.max(s.when, t.__ctx.__clock.now) - t0) * RATE) -
+      Math.round(s.offset * RATE);
+    assert.strictEqual(
+      ((phase % L) + L) % L,
+      0,
+      `the take was entered ${phase % L} samples off the loop top`
+    );
   },
 });
 

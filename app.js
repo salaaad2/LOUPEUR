@@ -24,14 +24,19 @@ const LATENCY_MARGIN = 0.005;    // covers the worklet's 128-sample block
 // the tail. One worklet block would do; 4096 is a safe first experiment.
 const CAPTURE_SLACK = 4096;
 
-// Calibration. The round trip is measured by playing a click through the
-// speakers and finding it in the mic. The window is long enough for a phone
-// used as a mic over ADB (~240 ms) plus the speaker and the air.
-const CALIBRATION_SECONDS = 1.5;
-const CALIBRATION_LEAD = 0.15;   // silence before the click, so the peak is not at index 0
-const CALIBRATION_PEAK = 0.9;    // amplitude of the click, well above room noise
-const CALIBRATION_MIN_PEAK = 0.02; // below this the click was not heard
-const CALIBRATION_TRIES = 3;     // takes per calibration; the median is kept
+// Calibration. The round trip is measured by playing short bursts through the
+// speakers and finding them in the mic. Five bursts, spaced further apart than
+// the longest delay the search window allows, so each window holds exactly one
+// and a late block cannot be mistaken for the next burst.
+const CAL_BURSTS = 5;
+const CAL_SPACING = 0.35;        // seconds between bursts
+const CAL_MARGIN = 0.02;         // silence before each burst in its own window
+const CAL_MAX_DELAY = 0.3;       // longest round trip a window allows
+const CAL_BURST = 0.01;          // burst length
+const CAL_WINDOW = 0.006;        // energy window, shorter than the burst
+const CAL_GAIN = 0.2;            // burst amplitude
+const CAL_MIN_AMPLITUDE = 0.01;  // below this the burst was not heard
+const TAKE_MIN_PEAK = 0.02;      // first-transient threshold for takeOffset
 
 // UI
 const CLEAR_HOLD_MS = 600;
@@ -425,21 +430,27 @@ function escapeHtml(s) {
 // Calibration
 // ---------------------------------------------------------------------------
 
-// Measures the round trip of the open input by playing a click through the
-// speakers and finding it in the mic. This is the only number in the app that
+// Measures the round trip of the open input by playing short bursts through the
+// speakers and finding them in the mic. This is the only number in the app that
 // is measured instead of guessed, and it is the one that makes a take land
 // where it was played.
 //
-// The click is scheduled at a known render frame. It is heard `outputLatency`
+// A burst is scheduled at a known render frame. It is heard `outputLatency`
 // later, travels through the air, and is stamped by the worklet `inputLatency`
-// after it was captured. So the peak of the recorded click sits at
+// after it was captured. So the burst sits at
 //
-//   clickFrame + roundTrip
+//   burstFrame + roundTrip
 //
 // and `roundTrip` is the whole correction: the player hears the transport late
 // by the output side and plays late by that much, and the mic stamps the result
 // late by the input side. Both are in the number, which is why it replaces the
 // estimate rather than adding to it.
+//
+// Five bursts, not one: a single measurement cannot tell a late block from a
+// late room. The median of the five, with values far from it dropped, is the
+// round trip. Each burst gets its own window, `CAL_MARGIN` before it was
+// scheduled and `CAL_MAX_DELAY` after, so a burst that comes back late is still
+// inside its own window and cannot be confused with the next one.
 //
 // The measurement is a raw capture, not a take: it does not touch the transport,
 // the loop length or any channel, so it can run with tracks playing.
@@ -448,50 +459,32 @@ async function calibrate() {
   const ok = await ensureMic();
   if (!ok) return;
 
-  const rate = ctx.sampleRate;
-  const frames = Math.round(CALIBRATION_SECONDS * rate);
-  const lead = Math.round(CALIBRATION_LEAD * rate);
   const deviceId = state.micId;
-  const results = [];
-
-  // A placeholder so the button reports progress before the first window opens.
-  calibration = { frames, results, deviceId, rec: null };
+  // A placeholder so the button reports progress before the window opens.
+  calibration = { rec: null };
   render();
 
   try {
-    for (let attempt = 0; attempt < CALIBRATION_TRIES; attempt++) {
-      const startAt = ctx.currentTime + 0.1;
-      const clickFrame = Math.round(startAt * rate) + lead;
-      const heard = await measureRoundTrip(startAt, clickFrame, frames);
-      if (heard === null) {
-        showBanner(
-          "Calibration heard nothing. Turn the speakers up, or use headphones " +
-            "on the desk next to the mic, and try again."
-        );
-        return;
-      }
-      results.push(heard);
-      // The next window is opened by measureRoundTrip; keep the count visible
-      // between the two.
-      if (calibration) calibration.results = results;
-      render();
+    const delay = await measureRoundTrip();
+    if (delay === null) {
+      showBanner(
+        "Calibration heard nothing. Turn the speakers up, or use headphones " +
+          "on the desk next to the mic, and try again."
+      );
+      return;
     }
 
-    // The median, not the mean: one take that caught a room noise or a late
-    // block should not drag the number.
-    const sorted = results.slice().sort((a, b) => a - b);
-    const median = sorted[Math.floor(sorted.length / 2)];
     // The measurement replaces the offset outright, and the slider is the same
     // number: it is written here so the control shows what is in force instead
     // of staying at 0 while a hidden value does the work.
-    storeDeviceOffset(deviceId, median / rate);
+    storeDeviceOffset(deviceId, delay / ctx.sampleRate);
     logCaptureShift();
     render();
     showBanner(
       "Calibrated: round trip " +
-        (median / rate * 1000).toFixed(1) +
+        (delay / ctx.sampleRate * 1000).toFixed(1) +
         " ms. The input offset is now " +
-        Math.round(median / rate * 1000) +
+        Math.round(delay / ctx.sampleRate * 1000) +
         " ms for this microphone, and every take uses it."
     );
   } finally {
@@ -500,50 +493,151 @@ async function calibrate() {
   }
 }
 
-// Opens a measurement window and plays the click into it. Resolves with the
-// round trip in samples, or null when the click was not heard.
+// Plays the bursts and returns the round trip in samples, or null when nothing
+// was heard or the measurements disagreed.
 //
 // The window is a raw capture: it does not touch the transport, the loop length
 // or any channel, so it can run with tracks playing. `calibration` owns the mic
 // while it is open, so a take cannot be spliced into it.
-function measureRoundTrip(startAt, clickFrame, frames) {
+async function measureRoundTrip() {
+  const rate = ctx.sampleRate;
+  const margin = Math.round(CAL_MARGIN * rate);
+  const span = Math.round((CAL_MARGIN + CAL_MAX_DELAY) * rate);
+  const win = Math.round(CAL_WINDOW * rate);
+
+  const t0 = ctx.currentTime + 0.25;
+  const times = [];
+  for (let i = 0; i < CAL_BURSTS; i++) times.push(t0 + i * CAL_SPACING);
+
+  // One window covering every burst: from the margin before the first to the
+  // longest delay after the last. The bursts are scheduled first; the window
+  // opens before the first one sounds, so nothing is missed.
+  const windowStart = Math.round(times[0] * rate) - margin;
+  const windowEnd = Math.round(times[times.length - 1] * rate) + span;
+  const frames = windowEnd - windowStart;
+
+  for (const t of times) playBurst(t);
+  const scratch = await captureWindow(windowStart, frames);
+  if (!scratch) return null;
+
+  const offsets = [];
+  let loudest = 0;
+  for (const t of times) {
+    const from = Math.round(t * rate) - windowStart - margin;
+    const window = scratch.subarray(from, from + span);
+    const amp = peakAmplitude(window, 0, window.length);
+    if (amp > loudest) loudest = amp;
+    const peak = energyPeak(window, 0, window.length, win);
+    if (peak < 0) continue;
+    offsets.push(peak - margin);
+  }
+
+  // Nothing came back: headphones, a muted mic, or a quiet room. Keep the API
+  // estimate rather than trusting a measurement of noise.
+  if (loudest < CAL_MIN_AMPLITUDE) return null;
+
+  return robustDelay(offsets);
+}
+
+// Opens a raw capture window and resolves with its samples once the window is
+// full, or null when the worklet stops delivering.
+function captureWindow(startFrame, frames) {
   return new Promise((resolve) => {
     const rec = {
-      startFrame: clickFrame,
-      endFrame: clickFrame + frames,
+      startFrame,
+      endFrame: startFrame + frames,
       scratch: new Float32Array(frames),
       lastFrame: null,
       resolve,
     };
-    calibration = { frames, results: [], deviceId: state.micId, rec };
+    calibration = { rec };
     render();
-    playCalibrationClick(startAt);
     // A worklet that stops delivering must not leave the button stuck.
     rec.timer = setTimeout(() => {
       if (calibration && calibration.rec === rec) {
         calibration.rec = null;
         resolve(null);
       }
-    }, (CALIBRATION_SECONDS + 1) * 1000);
+    }, (frames / ctx.sampleRate + 1) * 1000);
   });
 }
 
-// The click is a short burst, not a single sample: a one-sample impulse is
-// inaudible on most speakers and is lost in the resampling the browser does on
-// the way out. 3 ms at 1 kHz is loud, short, and has an unambiguous peak.
-function playCalibrationClick(when) {
+// A short tone burst at an exact audio-clock time, straight to the destination
+// so the master volume cannot silence the measurement. 10 ms at 2 kHz is loud,
+// short, and has an unambiguous onset.
+function playBurst(when) {
   const osc = ctx.createOscillator();
   const g = ctx.createGain();
-  osc.frequency.value = 1000;
+  osc.type = "sine";
+  osc.frequency.value = 2000;
   g.gain.setValueAtTime(0, when);
-  g.gain.linearRampToValueAtTime(CALIBRATION_PEAK, when + 0.001);
-  g.gain.exponentialRampToValueAtTime(0.0001, when + 0.003);
+  g.gain.linearRampToValueAtTime(CAL_GAIN, when + 0.001);
+  g.gain.setValueAtTime(CAL_GAIN, when + CAL_BURST - 0.001);
+  g.gain.linearRampToValueAtTime(0, when + CAL_BURST);
   osc.connect(g);
-  // Straight to the destination: the master gain and the reverb would colour
-  // the click, and the measurement wants the shortest path the speakers have.
   g.connect(ctx.destination);
   osc.start(when);
-  osc.stop(when + 0.004);
+  osc.stop(when + CAL_BURST + 0.01);
+  osc.onended = () => {
+    osc.disconnect();
+    g.disconnect();
+  };
+}
+
+// Index of the highest short-window energy in [from, to), or -1 when the window
+// holds no energy at all (silence) or is too short to scan. Energy rather than
+// raw peak, so a single stray sample cannot win.
+function energyPeak(samples, from, to, windowSamples) {
+  const lo = Math.max(0, from);
+  const hi = Math.min(samples.length, to);
+  const win = Math.max(1, windowSamples);
+  if (hi - lo < win) return -1;
+
+  let bestIndex = -1;
+  let bestEnergy = 0;
+  let energy = 0;
+  for (let i = lo; i < lo + win; i++) energy += samples[i] * samples[i];
+
+  for (let i = lo; i + win <= hi; i++) {
+    if (energy > bestEnergy) {
+      bestEnergy = energy;
+      bestIndex = i;
+    }
+    const out = samples[i];
+    const inc = samples[i + win];
+    energy += inc * inc - out * out;
+  }
+  return bestIndex;
+}
+
+// Peak amplitude in [from, to), for deciding whether the burst was heard.
+function peakAmplitude(samples, from, to) {
+  const lo = Math.max(0, from);
+  const hi = Math.min(samples.length, to);
+  let peak = 0;
+  for (let i = lo; i < hi; i++) {
+    const v = Math.abs(samples[i]);
+    if (v > peak) peak = v;
+  }
+  return peak;
+}
+
+function median(values) {
+  const s = [...values].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// Robust estimate from several measurements. Drops values far from the median
+// so one bad detection cannot skew the result. Returns null when there is not
+// enough agreement to trust the measurement.
+function robustDelay(offsets) {
+  if (!offsets || offsets.length < 3) return null;
+  const med = median(offsets);
+  const tolerance = Math.max(1, Math.abs(med) * 0.25);
+  const kept = offsets.filter((v) => Math.abs(v - med) <= tolerance);
+  if (kept.length < 3) return null;
+  return kept.reduce((a, b) => a + b, 0) / kept.length;
 }
 
 // The index of the first sample above `threshold`, or -1. The first crossing,
@@ -571,8 +665,7 @@ function onCalibrationFrame(frame, data) {
 
   clearTimeout(rec.timer);
   calibration.rec = null;
-  const at = firstCrossing(rec.scratch, CALIBRATION_MIN_PEAK);
-  rec.resolve(at < 0 ? null : at);
+  rec.resolve(rec.scratch);
 }
 
 // The offset a finished take landed at, in samples: how far the audio of the
@@ -583,15 +676,15 @@ function onCalibrationFrame(frame, data) {
 // recorded against a click on the boundary should report ~0.
 function takeOffset(rec) {
   if (!rec || rec.startFrame === null) return null;
-  const at = firstCrossing(rec.scratch, CALIBRATION_MIN_PEAK);
+  const at = firstCrossing(rec.scratch, TAKE_MIN_PEAK);
   if (at < 0) return null;
-  return at - rec.shift;
+  return at;
 }
 
-// Records one short take against the click and reports where the click landed.
-// This is the check the user can run after calibrating, and the one that says
-// whether the number in force is right for this device: a take that reports
-// +40 ms is 40 ms late.
+// Measures the round trip again and compares it to the offset in force. This is
+// the check the user can run after calibrating, and the one that says whether
+// the number in force is right for this device: an offset that is 40 ms short
+// leaves every take 40 ms late.
 //
 // It corrects the offset itself instead of telling the user to do the
 // arithmetic. The measurement is the residual error of the offset in force, so
@@ -599,9 +692,8 @@ function takeOffset(rec) {
 // number. Reporting "raise it by 40 ms" and leaving the user to move a slider
 // was the step where the previous version lost them.
 //
-// It is a real take through the real path -- armed at a loop boundary, captured
-// by the worklet, sliced by finishCapture -- so it measures what a take does,
-// not what the arithmetic says it should do.
+// It is the same raw capture as calibrate, not a take through finishCapture, so
+// it measures the device rather than the take path.
 async function syncCheck() {
   if (calibration) return;
   const ok = await ensureMic();
@@ -612,40 +704,42 @@ async function syncCheck() {
   }
 
   const rate = ctx.sampleRate;
-  const frames = Math.round(CALIBRATION_SECONDS * rate);
-  const lead = Math.round(CALIBRATION_LEAD * rate);
-  const startAt = ctx.currentTime + 0.1;
-  const clickFrame = Math.round(startAt * rate) + lead;
-
-  const heard = await measureRoundTrip(startAt, clickFrame, frames);
-
-  calibration = null;
+  calibration = { rec: null };
   render();
 
-  if (heard === null) {
+  let measured;
+  try {
+    measured = await measureRoundTrip();
+  } finally {
+    calibration = null;
+    render();
+  }
+
+  if (measured === null) {
     showBanner("Sync check heard nothing. Turn the speakers up and try again.");
     return;
   }
 
-  // The click was played at `clickFrame`, so the take is late by however far
-  // the click sits past the start of the window.
-  const residual = heard - lead;
+  // The measurement is the round trip the device actually has; the offset in
+  // force is what the app is correcting by. The residual is the difference, so
+  // a positive number means the take still lands late.
+  const before = offsetFor(state.micId);
+  const residual = measured - Math.round(before * rate);
   const ms = (residual / rate * 1000).toFixed(1);
   console.info("[loupeur] sync check: %s ms (%s samples)", ms, residual);
 
   if (Math.abs(residual) < Math.round(0.005 * rate)) {
-    showBanner("Sync check: the take is within 5 ms of the boundary. Good.");
+    showBanner("Sync check: the offset is within 5 ms of the measured round trip. Good.");
     return;
   }
 
-  const before = offsetFor(state.micId);
   const after = Math.max(0, before + residual / rate);
   storeDeviceOffset(state.micId, after);
   logCaptureShift();
   render();
   showBanner(
-    "Sync check: the take was " +
-      (residual > 0 ? "late" : "early") +
+    "Sync check: the offset was " +
+      (residual > 0 ? "short" : "long") +
       " by " +
       Math.abs(ms) +
       " ms. The input offset is now " +
@@ -714,9 +808,9 @@ function onCaptureFrame(e) {
   const rec = pendingRecord;
 
   // The take starts at the first block that overlaps the capture window. For
-  // an armed take the window opens at a loop boundary, so blocks that arrive
-  // before it are dropped and the take is anchored to the boundary itself.
-  // The window is shifted back by the input latency, so the block that
+  // an armed take the window opens `shift` after a loop boundary, so blocks
+  // that arrive before it are dropped and the take is anchored to the boundary
+  // itself. The window is shifted forward by the round trip, so the block that
   // carries the sound of the boundary is the one that opens the take.
   //
   // The anchor is the prediction, never the first block. The worklet delivers
@@ -851,7 +945,8 @@ function schedulePending() {
 }
 
 // Loop position, in samples, that a channel's buffer starts at when its source
-// is started at `when`.
+// is started at `when`. `scheduleChannel` converts it to the seconds `start()`
+// wants; nothing else may.
 //
 // The modulo is taken against the buffer's own length, not loopSamples(). The
 // two differ by the seam in Free Mode, and the buffer length is the only length
@@ -1011,7 +1106,15 @@ function stopArmTimer() {
   }
 }
 
-function scheduleChannel(ch, when, offset) {
+// `offsetSamples` is a position in the buffer, in samples; `when` is a time on
+// the context clock, in seconds. `start()` takes both in seconds, so the
+// conversion happens here and nowhere else. Passing the sample count straight
+// through made it larger than the buffer duration, which the API clamps to the
+// end of the buffer: the source then started at its head at `when` instead of at
+// the phase `when` represents, and a track entered mid-loop landed
+// `(when - t0) mod L` late -- permanently, because a looping source is never
+// re-scheduled.
+function scheduleChannel(ch, when, offsetSamples) {
   if (!ch.buffer) return;
   // Retire the previous source so they do not accumulate.
   if (ch.source) {
@@ -1023,7 +1126,7 @@ function scheduleChannel(ch, when, offset) {
   // A source entered mid-loop plays the remainder of the buffer and then
   // loops from its head, so the track stays aligned with the transport.
   src.loop = true;
-  src.start(when, offset || 0);
+  src.start(when, (offsetSamples || 0) / ctx.sampleRate);
   // Drop the reference once the source ends, so a track that stopped on its
   // own is treated as pending again instead of holding a dead source.
   src.onended = () => {
@@ -1082,10 +1185,13 @@ function armCapture(ch, startTime, endTime, lengthSamples) {
   // also the block that fills the buffer and any rounding or late delivery cuts
   // the tail. The slack is never part of the take: finishCapture slices it off.
   const cap = take + CAPTURE_SLACK;
-  // The mic runs `shift` behind the render clock, so the samples that belong at
-  // `startTime` are stamped that much earlier. Shifting the whole window back by
-  // it puts the take where the user played it instead of `shift` late. The
-  // window keeps its length, so the loop length and the seam fold are
+  // The mic stamps a sound `shift` after the render frame it belongs at: the
+  // player hears the transport late by the output side and plays late by that
+  // much, and the worklet stamps the result late by the input side again. So
+  // the window opens `shift` *after* the boundary, and the audio of the
+  // boundary lands at scratch index 0. Opening it `shift` before the boundary
+  // instead puts the take `2 * shift` late and the correction does nothing.
+  // The window keeps its length, so the loop length and the seam fold are
   // unaffected. `shift` is a measured round trip when one exists, and the sum of
   // the reported buffers otherwise; see captureShift.
   const shift = Math.round(captureShift() * ctx.sampleRate);
@@ -1095,23 +1201,21 @@ function armCapture(ch, startTime, endTime, lengthSamples) {
     startFrame: null,
     // Frame the capture window opens at. Blocks before it are discarded, so an
     // armed take begins exactly at the loop boundary.
-    startFramePredicted: Math.round(startTime * ctx.sampleRate) - shift,
-    // Samples of pre-boundary audio at the head of `scratch`. The window opens
-    // `shift` before the boundary, so scratch index 0 is NOT the boundary: the
-    // waveform subtracts it to put the take at the left edge.
+    startFramePredicted: Math.round(startTime * ctx.sampleRate) + shift,
+    // Samples the window opens after the boundary. The audio of the boundary is
+    // stamped `shift` after it, so the two meet at scratch index 0.
     shift,
-    // Render frame the take belongs at. The window opens `shift` before it, so
-    // the audio of the boundary is stamped here and lands at scratch index 0.
+    // Render frame the take belongs at.
     boundaryFrame: Math.round(startTime * ctx.sampleRate),
     lastFrame: null,
     // Last scratch index the take wants. The write bound: samples past it are
     // the slack and are dropped.
-    endFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) - shift,
+    endFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) + shift,
     // Frame the take finishes at. It is the end of the window, slack included,
     // so the block carrying the last wanted sample has been written before the
     // take closes. Finishing on endFrame instead cut the tail by however much of
     // that block lay past it.
-    stopFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) - shift + CAPTURE_SLACK,
+    stopFrame: endTime === Infinity ? Infinity : Math.round(endTime * ctx.sampleRate) + shift + CAPTURE_SLACK,
     lengthSamples: lengthSamples || 0,
     scratch: new Float32Array(cap),
     // True only for the first Free Mode take, which defines the loop length
@@ -1230,17 +1334,18 @@ function finishCapture() {
   ch.layers = 1;
   ch.state = "playing";
 
-  // A later take is entered at its own start boundary, not at "now". Its capture
-  // window is L + seam long, so finishCapture fires seam samples after the
-  // boundary it began on; entering at "now" would start the buffer seam samples
-  // into itself and play the whole take late by that much. The first Free Mode
-  // take has no boundary to wait for: it defines t0 itself and is entered
-  // immediately.
-  if (rec.definesLoop) {
-    schedulePending();
-  } else {
-    scheduleChannel(ch, rec.startTime, 0);
-  }
+  // Enter the take at the loop position the transport has reached, never at the
+  // boundary it was recorded from. That boundary is always in the past by the
+  // time the take commits: the window opens at `boundary + shift` and runs the
+  // take, the seam and CAPTURE_SLACK, so `start(rec.startTime, 0)` clamps to
+  // "now" and plays the buffer from its head at whatever phase the loop happens
+  // to be at. The take then sits `shift + seam + CAPTURE_SLACK` late, and stays
+  // there, because a looping source is never re-scheduled. Every track recorded
+  // over an existing loop landed that far behind the one it was played against.
+  //
+  // schedulePending enters at `max(now, t0)` with the offset the transport has
+  // reached, which is the same rule a stop/start and an overdub use.
+  schedulePending();
   render();
 }
 
@@ -1341,7 +1446,7 @@ function commitOverdub(ch, scratch, take) {
   const data = buf.getChannelData(0);
   data.set(old.getChannelData(0));
   // The take starts at scratch index 0, which is the loop boundary: the window
-  // was opened `shift` before it and the anchor is the prediction, so the layer
+  // was opened `shift` after it and the anchor is the prediction, so the layer
   // lines up with the buffer it is added to. `take` is the loop length, not the
   // whole window, so the slack is not folded in.
   const add = scratch.subarray(0, Math.min(take, old.length));
@@ -1634,18 +1739,15 @@ function drawWave(ch, canvas) {
     if (rec.lengthSamples) {
       // The envelope is a grid over the whole scratch buffer, so bucket i sits
       // at scratch index i * per. The audio is written at `micFrame -
-      // startFrame`, so the display has to use the same origin: `origin` is the
-      // scratch index the take starts at, which is 0 once the anchor is
-      // resolved and `shift` before that. Subtracting `rec.shift` instead put
-      // the wave `shift` samples to the left of the audio whenever the anchor
-      // was not the prediction.
+      // startFrame`, and the window opens `shift` after the boundary, so
+      // scratch index 0 is the boundary's audio: the display and the audio
+      // share one origin.
       //
       // The canvas spans the take, not the window: the window carries
       // CAPTURE_SLACK samples past the end of the take, and drawing those would
       // squeeze the take into the left of the picture.
       const per = span / liveEnv.length;
-      const origin = rec.startFrame === null ? rec.shift : 0;
-      drawEnvelopeTimeline(g, liveEnv, per, origin, rec.lengthSamples, cssW, cssH, mid, color);
+      drawEnvelopeTimeline(g, liveEnv, per, 0, rec.lengthSamples, cssW, cssH, mid, color);
     } else {
       const used = Math.max(1, Math.ceil((filled / span) * liveEnv.length));
       drawEnvelope(g, liveEnv.subarray(0, used), cssW, cssH, mid, color);
@@ -1889,9 +1991,7 @@ function render() {
   // Calibration owns the mic while it runs, so nothing else may start a take.
   const busy = Boolean(calibration);
   el.calibrate.disabled = busy;
-  el.calibrate.textContent = busy
-    ? "Calibrating " + (calibration.results.length + 1) + "/" + CALIBRATION_TRIES
-    : "Calibrate";
+  el.calibrate.textContent = busy ? "Calibrating…" : "Calibrate";
   el.syncCheck.disabled = busy || !hasAudio;
 
   el.modeHelp.textContent =

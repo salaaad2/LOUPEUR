@@ -35,21 +35,41 @@ the source actually loops on. A modulo against `L` leaves the source up to
 that much. The waveform playhead measures against the buffer length for the same
 reason.
 
-## A recorded take is entered at its own start, not at "now"
+## `loopOffset()` returns samples; `start()` wants seconds
 
-`finishCapture()` starts a later take with `scheduleChannel(ch, rec.startTime, 0)`.
-Its capture window is `L + seam` long, so `finishCapture` fires `seam` samples
-*after* the boundary the take began on. Entering at "now" starts the buffer
-`seam` samples into itself and plays the whole take late, permanently, because
-the buffer is `L` long and the error never cancels.
+`scheduleChannel()` is the only caller of `AudioBufferSourceNode.start()`, and it
+divides the offset by `ctx.sampleRate`. Nothing else may convert.
 
-The first Free Mode take is the exception: it defines `t0` itself and has no
-boundary to wait for, so it goes through `schedulePending()`.
+Passing the sample count straight through is silent and expensive. The number is
+thousands of seconds, far past the buffer duration, and the API clamps it to the
+end of the buffer: the source starts at its head at `when` instead of at the
+phase `when` represents. Every track entered mid-loop then landed
+`(when − t0) mod L` late — 330 ms for a take that had just committed — and stayed
+there, because a looping source is never re-scheduled. The metronome is scheduled
+directly on the grid, so it stayed correct, which is what made the error look
+like "the playback is shifted" rather than "the capture is shifted": a track
+recorded from the metronome landed on the beat, and a track recorded from another
+track's playback landed late by the same amount.
 
-`schedulePending()` enters a take at `max(now, t0)` with the offset the
-transport has already reached. Waiting for the *next* boundary when the take's
-start has already gone by skips a whole loop — the "full loop of silence after
-punch-out" symptom.
+## A committed take is entered at the loop position the transport reached
+
+`finishCapture()` enters every take through `schedulePending()`, which starts it
+at `max(now, t0)` with the offset the transport has already reached.
+
+It must not start it at `rec.startTime`. That boundary is always in the past by
+the time the take commits: the window opens at `boundary + shift` and runs the
+take, the seam and `CAPTURE_SLACK`, so `finishCapture` fires
+`shift + L + seam + CAPTURE_SLACK` after the boundary. `start(rec.startTime, 0)`
+clamps to "now" and plays the buffer from its head at whatever phase the loop
+happens to be at, so the take lands `shift + seam + CAPTURE_SLACK` late — and
+stays there, because a looping source is never re-scheduled. That is the "track
+2 is late, track 1 is fine" report: track 1 had been re-entered by a stop/start
+in the meantime, and only the freshly committed take carried the error.
+
+Waiting for the *next* boundary instead would be exact but skips up to a whole
+loop of silence — the "full loop of silence after punch-out" symptom. Entering
+at the current position is what a stop/start and an overdub already do, so all
+three agree.
 
 ## A looping source is never re-scheduled
 
@@ -61,8 +81,8 @@ and re-enters it at the wrong offset. `scheduleChannel` clears `ch.source` in
 ## Capture is anchored to a predicted frame, not the first block
 
 `armCapture` stores `startFramePredicted = round(startTime × sampleRate)`, shifted
-back by the capture shift. `onCaptureFrame` drops blocks that end at or before
-it, and the take is anchored to `startFramePredicted` itself:
+**forward** by the capture shift. `onCaptureFrame` drops blocks that end at or
+before it, and the take is anchored to `startFramePredicted` itself:
 
 ```js
 rec.startFrame = rec.startFramePredicted;
@@ -72,15 +92,17 @@ The worklet delivers blocks on its own schedule, so the first block that
 overlaps the window almost always starts *after* the prediction. Anchoring to
 that block instead would discard the latency correction and slide the whole
 take, and `endFrame` with it. The samples between the prediction and the first
-block stay zero, which is correct: they are the pre-boundary audio the window
-was opened for.
+block stay zero, which is correct: they are the audio the window was opened for.
 
 The worklet stamps a block with the render frame it was processed at, but the
-samples inside it were captured earlier. The window is shifted back by that much
-so the take lands where it was played. The shift is applied to the **window**,
-not the buffer, so the loop length, the seam fold and the boundary alignment are
-untouched. `startFrame` and `lastFrame` are therefore already mic frames: do not
-subtract the latency a second time.
+samples inside it were captured earlier. A sound the player meant for render
+frame `f` is therefore stamped at `f + shift`, where `shift` is the whole round
+trip. The window opens at `boundary + shift`, so the audio of the boundary is
+scratch index 0. Opening it at `boundary - shift` instead put the take
+`2 * shift` late, which is why a calibrated offset had no audible effect. The
+shift is applied to the **window**, not the buffer, so the loop length, the seam
+fold and the boundary alignment are untouched. `startFrame` and `lastFrame` are
+therefore already mic frames: do not subtract the latency a second time.
 
 **Both sides matter.** An earlier version of this file claimed `outputLatency`
 cancels out because the click and the recorded audio share the render clock.
@@ -105,18 +127,24 @@ The estimate above is a lower bound, and a lower bound is not a fix: a take that
 lands 500 ms late is still 500 ms late if the correction only removes 49 ms of
 it. So the shift is measured, per device, by a loopback calibration.
 
-`calibrate()` runs `measureRoundTrip` three times and stores the median. Each
-run plays a 1 kHz, 3 ms burst straight to `ctx.destination` -- not through the
-master gain or the reverb, which would colour it -- and records the mic into a
-window that opens at the scheduled click frame. The measurement is the index of
-the first sample above `CALIBRATION_MIN_PEAK` in that window: the round trip,
-output latency plus air plus input latency, all of it.
+`calibrate()` plays five 2 kHz, 10 ms bursts straight to `ctx.destination` -- not
+through the master gain or the reverb, which would colour them -- and records the
+mic into one window that covers all five. Each burst gets its own search window,
+`CAL_MARGIN` before it was scheduled and `CAL_MAX_DELAY` after, so a burst that
+comes back late is still inside its own window and cannot be confused with the
+next one. The measurement is the index of the highest short-window energy in
+that window: the round trip, output latency plus air plus input latency, all of
+it.
 
-The first crossing, not the global peak. A room noise later in the window can be
-louder than the click, and the click is the first thing in it.
+Energy, not the first crossing. A single stray sample cannot win a window, and
+the energy window is shorter than the burst, so the peak is its onset.
 
-A silent window resolves to `null`, never to zero. A silent room must not be
-stored as "this device has no latency".
+Five bursts, not one, and the median of the five with values far from it
+dropped. A single measurement cannot tell a late block from a late room; the
+robust estimate can.
+
+A window with nothing above `CAL_MIN_AMPLITUDE` resolves to `null`, never to
+zero. A silent room must not be stored as "this device has no latency".
 
 `calibration` is a module-level variable that owns the mic while it runs:
 `onCaptureFrame` hands every block to `onCalibrationFrame` and returns, so a
@@ -149,16 +177,17 @@ correction has to be able to subtract.
 
 ### The sync check
 
-`syncCheck()` records one short take against the click and measures the residual
-error of the offset in force. It goes through the real capture path -- armed at
-a loop boundary, captured by the worklet, sliced by `finishCapture` -- so it
-measures what a take does, not what the arithmetic says it should do.
+`syncCheck()` runs the same measurement and compares it to the offset in force.
+The residual is `measured - offsetFor(device)`: positive means the offset is
+short and the take still lands late. It is the same raw capture as `calibrate`,
+not a take through `finishCapture`, so it measures the device rather than the
+take path.
 
-It then **corrects the offset itself** and says so: "the take was late by 40 ms,
-the input offset is now 240 ms". Reporting "raise the offset by 40 ms" and
-leaving the user to move a slider was the step where the previous version lost
-them; the measurement is the residual, so adding it to the offset is the fix and
-there is no reason to make the user do it.
+It then **corrects the offset itself** and says so: "the offset was short by
+40 ms, the input offset is now 240 ms". Reporting "raise the offset by 40 ms"
+and leaving the user to move a slider was the step where the previous version
+lost them; the measurement is the residual, so adding it to the offset is the
+fix and there is no reason to make the user do it.
 
 `finishCapture` also logs `[loupeur] take offset: … ms` for every take that
 started on a boundary, so a wrong shift is visible in the console without
