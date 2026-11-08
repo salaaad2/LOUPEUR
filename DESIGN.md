@@ -90,9 +90,8 @@ lands that much late. `captureShift()` is the one place that number comes from:
 
 ```js
 function captureShift() {
-  const measured = deviceOffsetFor(state.micId);
-  if (measured > 0) return measured;      // a calibration, per device
-  return inputLatency + outputLatency;    // the reported buffers
+  const base = deviceOffsetFor(state.micId) || inputLatency + outputLatency;
+  return Math.max(0, base + manualOffsetFor(state.micId));
 }
 ```
 
@@ -100,6 +99,51 @@ A measured round trip wins over the estimate, because the estimate cannot see
 buffering the browser does not report: a phone used as a mic over ADB, a
 Bluetooth bridge, a virtual loopback. Those add tens to hundreds of
 milliseconds that no API exposes. The estimate is a lower bound.
+
+## The shift is measured, not guessed
+
+The estimate above is a lower bound, and a lower bound is not a fix: a take that
+lands 500 ms late is still 500 ms late if the correction only removes 49 ms of
+it. So the shift is measured, per device, by a loopback calibration.
+
+`calibrate()` runs `measureRoundTrip` three times and stores the median. Each
+run plays a 1 kHz, 3 ms burst straight to `ctx.destination` -- not through the
+master gain or the reverb, which would colour it -- and records the mic into a
+window that opens at the scheduled click frame. The measurement is the index of
+the first sample above `CALIBRATION_MIN_PEAK` in that window: the round trip,
+output latency plus air plus input latency, all of it.
+
+The first crossing, not the global peak. A room noise later in the window can be
+louder than the click, and the click is the first thing in it.
+
+A silent window resolves to `null`, never to zero. A silent room must not be
+stored as "this device has no latency".
+
+`calibration` is a module-level variable that owns the mic while it runs:
+`onCaptureFrame` hands every block to `onCalibrationFrame` and returns, so a
+measurement can never be spliced into a take that happens to be open.
+
+### The manual offset
+
+The measurement is a number, not a truth. A device can drift, a browser can
+change its buffering, and a user can be playing slightly behind the click. The
+`#offset` slider adds a per-device manual offset on top of the measurement, and
+it may be negative: a take that lands early is as wrong as one that lands late.
+`captureShift()` clamps the sum at zero, because a negative shift would open the
+window after the boundary and lose the head of the take.
+
+### The sync check
+
+`syncCheck()` records one short take against the click and reports where the
+click landed relative to the boundary, in the banner: "late by 40 ms, raise the
+input offset by 40 ms". It goes through the real capture path -- armed at a loop
+boundary, captured by the worklet, sliced by `finishCapture` -- so it measures
+what a take does, not what the arithmetic says it should do. That is the number
+the user reads to decide whether to touch the slider.
+
+`finishCapture` also logs `[loupeur] take offset: … ms` for every take that
+started on a boundary, so a wrong shift is visible in the console without
+exporting a WAV and measuring it in an editor.
 
 ## The window is the take plus slack
 

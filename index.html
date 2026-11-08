@@ -58,6 +58,21 @@
         <option value="">Default input</option>
       </select>
     </div>
+
+    <div class="control">
+      <label class="nb-label" for="offset">Input offset <output id="offsetOut">0</output> ms</label>
+      <input type="range" id="offset" min="-500" max="500" step="1" value="0">
+    </div>
+
+    <div class="control">
+      <label class="nb-label">Latency</label>
+      <button type="button" id="calibrate" class="nb-button">Calibrate</button>
+    </div>
+
+    <div class="control">
+      <label class="nb-label">Sync check</label>
+      <button type="button" id="syncCheck" class="nb-button">Measure take</button>
+    </div>
   </section>
 
   <section class="tracks" id="tracks"></section>

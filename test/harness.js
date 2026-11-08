@@ -37,6 +37,16 @@ const EXPORTS = [
   "scheduleChannel",
   "startTransport",
   "nextBoundaryTime",
+  "calibrate",
+  "syncCheck",
+  "measureRoundTrip",
+  "onCalibrationFrame",
+  "firstCrossing",
+  "takeOffset",
+  "manualOffsetFor",
+  "storeManualOffset",
+  "deviceOffsetFor",
+  "storeDeviceOffset",
 ];
 
 // Names are probed with typeof so the harness still loads against a version of
@@ -47,9 +57,12 @@ function exportBlock() {
     "get pendingRecord() { return pendingRecord; }",
     "get liveEnv() { return liveEnv; }",
     "get inputLatency() { return inputLatency; }",
+    "get outputLatency() { return outputLatency; }",
     "get ctx() { return ctx; }",
     "get micStream() { return micStream; }",
+    "get calibration() { return calibration; }",
     "set inputLatency(v) { inputLatency = v; }",
+    "set outputLatency(v) { outputLatency = v; }",
     "set pendingRecord(v) { pendingRecord = v; }",
   ];
   const probes = EXPORTS.map(

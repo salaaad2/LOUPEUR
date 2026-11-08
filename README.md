@@ -89,6 +89,12 @@ latency of the hardware:
 3. **The display agrees with the audio.** The buffer index of a peak and the x
    position the waveform gives that sample refer to the same fraction of the take.
 
+The calibration tests cover the measurement itself: a known round trip comes back
+as that round trip, silence is reported as no measurement rather than as zero, a
+louder noise after the click does not move the result, the manual offset is added
+to the measurement and stored per device, and the sync check reports a late take
+as late by the amount it is late.
+
 They assert internal consistency, not an absolute offset, which is why they hold
 on any device. Anything involving real capture, scheduling or rendering still
 needs a browser and a microphone.
@@ -99,10 +105,10 @@ needs a browser and a microphone.
   feedback but means you hear yourself only through the recorded loop.
 - An overdub becomes audible one loop boundary after you punch out, because the
   buffer is replaced at the boundary rather than mutated in place.
-- Latency compensation is an estimate: the device's reported input latency plus
-  `outputLatency` plus a 5 ms margin. It cannot see buffering the browser does
-  not report, so a phone used as a mic over ADB or a Bluetooth bridge still lands
-  late. `captureShift()` already prefers a measured per-device round trip when
-  one is stored, but nothing in the UI writes one yet; that calibration is the
-  next step.
+- Latency compensation is only as good as the calibration. Until you run
+  **Calibrate**, the shift falls back to the device's reported input latency plus
+  `outputLatency`, which is a lower bound: a phone used as a mic over ADB or a
+  Bluetooth bridge still lands late. Run **Calibrate** once per device, then
+  **Sync check** to confirm, and nudge the offset slider if it reports a few
+  milliseconds either way.
 - Export renders one loop plus a 1 s reverb tail, trimmed to the loop length.

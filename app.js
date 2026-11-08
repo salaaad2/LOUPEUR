@@ -24,6 +24,15 @@ const LATENCY_MARGIN = 0.005;    // covers the worklet's 128-sample block
 // the tail. One worklet block would do; 4096 is a safe first experiment.
 const CAPTURE_SLACK = 4096;
 
+// Calibration. The round trip is measured by playing a click through the
+// speakers and finding it in the mic. The window is long enough for a phone
+// used as a mic over ADB (~240 ms) plus the speaker and the air.
+const CALIBRATION_SECONDS = 1.5;
+const CALIBRATION_LEAD = 0.15;   // silence before the click, so the peak is not at index 0
+const CALIBRATION_PEAK = 0.9;    // amplitude of the click, well above room noise
+const CALIBRATION_MIN_PEAK = 0.02; // below this the click was not heard
+const CALIBRATION_TRIES = 3;     // takes per calibration; the median is kept
+
 // UI
 const CLEAR_HOLD_MS = 600;
 const WAVE_BUCKETS = 200;
@@ -60,7 +69,6 @@ let captureNode = null;
 let captureReady = false;
 let inputLatency = 0;        // seconds, mic buffer; see measureInputLatency
 let outputLatency = 0;       // seconds, speaker buffer; see measureOutputLatency
-let deviceOffset = 0;        // seconds, measured round trip; see captureShift
 let schedulerTimer = null;
 let armTimer = null;         // promotes an armed take at its loop boundary
 let nextBoundaryIndex = 0;   // next loop index to schedule
@@ -68,6 +76,7 @@ let nextBeatIndex = 0;       // next metronome beat to schedule, in beats from t
 let pendingRecord = null;    // the take in progress, see armCapture
 let liveEnv = null;          // envelope of the take in progress, for the waveform
 let countInOscs = [];        // clicks of a count-in that has not finished yet
+let calibration = null;      // the round-trip measurement in progress, see calibrate
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -88,6 +97,10 @@ const el = {
   masterOut: document.getElementById("masterOut"),
   exportBtn: document.getElementById("export"),
   modeHelp: document.getElementById("modeHelp"),
+  calibrate: document.getElementById("calibrate"),
+  offset: document.getElementById("offset"),
+  offsetOut: document.getElementById("offsetOut"),
+  syncCheck: document.getElementById("syncCheck"),
 };
 
 // ---------------------------------------------------------------------------
@@ -207,8 +220,8 @@ async function ensureMic() {
     outputLatency = measureOutputLatency();
     // The measured offset belongs to the device, so it is re-read on every mic
     // open. Reading it once at boot would keep the previous device's number
-    // after a switch, with nothing in the UI saying so.
-    deviceOffset = deviceOffsetFor(state.micId);
+    // after a switch, with nothing in the UI saying so. captureShift() reads it
+    // from the store on every call, so there is no cached copy to go stale.
     logCaptureShift();
     // Labels are only readable once a stream has been granted, so the picker
     // is filled here rather than at boot.
@@ -286,20 +299,26 @@ function measureOutputLatency() {
 //
 // The estimate is the sum of the two reported buffers plus the worklet margin.
 // It is a lower bound, and it is what the app used before calibration existed.
+//
+// The manual offset is added on top of whichever number is in force, and it is
+// the only correction that can be dialled in by ear. It is stored per device
+// like the measurement, so a value set for the phone does not follow the USB
+// mic.
 function captureShift() {
   const measured = deviceOffsetFor(state.micId);
-  if (measured > 0) return measured;
-  return inputLatency + outputLatency;
+  const base = measured > 0 ? measured : inputLatency + outputLatency;
+  return Math.max(0, base + manualOffsetFor(state.micId));
 }
 
-// Measured round trips, keyed by deviceId. Per device, because the offset
-// belongs to the interface and not to the app: a value dialled in for the phone
-// must not silently apply to the USB mic.
+// Measured round trips and manual offsets, keyed by deviceId. Per device,
+// because the offset belongs to the interface and not to the app: a value
+// dialled in for the phone must not silently apply to the USB mic.
 const OFFSET_KEY = "loupeur.offset.v1";
+const MANUAL_KEY = "loupeur.manual.v1";
 
-function loadOffsets() {
+function loadStore(key) {
   try {
-    const raw = localStorage.getItem(OFFSET_KEY);
+    const raw = localStorage.getItem(key);
     const parsed = raw ? JSON.parse(raw) : null;
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch (_) {
@@ -307,29 +326,48 @@ function loadOffsets() {
   }
 }
 
+function saveStore(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (_) {
+    // Private mode or a full quota: the value still applies to this session,
+    // it just will not survive a reload.
+  }
+}
+
 function deviceOffsetFor(deviceId) {
-  const value = loadOffsets()[deviceId || ""];
+  const value = loadStore(OFFSET_KEY)[deviceId || ""];
   return typeof value === "number" && value > 0 ? value : 0;
 }
 
 function storeDeviceOffset(deviceId, seconds) {
-  const offsets = loadOffsets();
+  const offsets = loadStore(OFFSET_KEY);
   if (seconds > 0) offsets[deviceId || ""] = seconds;
   else delete offsets[deviceId || ""];
-  try {
-    localStorage.setItem(OFFSET_KEY, JSON.stringify(offsets));
-  } catch (_) {
-    // Private mode or a full quota: the measurement still applies to this
-    // session, it just will not survive a reload.
-  }
+  saveStore(OFFSET_KEY, offsets);
+}
+
+// The manual offset may be negative: a take that lands early is as wrong as one
+// that lands late, and the only way to fix it is to subtract.
+function manualOffsetFor(deviceId) {
+  const value = loadStore(MANUAL_KEY)[deviceId || ""];
+  return typeof value === "number" && isFinite(value) ? value : 0;
+}
+
+function storeManualOffset(deviceId, seconds) {
+  const offsets = loadStore(MANUAL_KEY);
+  if (seconds) offsets[deviceId || ""] = seconds;
+  else delete offsets[deviceId || ""];
+  saveStore(MANUAL_KEY, offsets);
 }
 
 // The shift is invisible otherwise, and a wrong shift is indistinguishable from
 // a wrong measurement without it. Logged once per mic open, not per take.
 function logCaptureShift() {
   const measured = deviceOffsetFor(state.micId);
+  const manual = manualOffsetFor(state.micId);
   console.info(
-    "[loupeur] capture shift: %s ms (%s samples), %s",
+    "[loupeur] capture shift: %s ms (%s samples), %s%s",
     (captureShift() * 1000).toFixed(1),
     Math.round(captureShift() * ctx.sampleRate),
     measured > 0
@@ -338,7 +376,8 @@ function logCaptureShift() {
         (inputLatency * 1000).toFixed(1) +
         " ms + output " +
         (outputLatency * 1000).toFixed(1) +
-        " ms"
+        " ms",
+    manual ? " + manual " + (manual * 1000).toFixed(1) + " ms" : ""
   );
 }
 
@@ -384,6 +423,221 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   })[c]);
+}
+
+// ---------------------------------------------------------------------------
+// Calibration
+// ---------------------------------------------------------------------------
+
+// Measures the round trip of the open input by playing a click through the
+// speakers and finding it in the mic. This is the only number in the app that
+// is measured instead of guessed, and it is the one that makes a take land
+// where it was played.
+//
+// The click is scheduled at a known render frame. It is heard `outputLatency`
+// later, travels through the air, and is stamped by the worklet `inputLatency`
+// after it was captured. So the peak of the recorded click sits at
+//
+//   clickFrame + roundTrip
+//
+// and `roundTrip` is the whole correction: the player hears the transport late
+// by the output side and plays late by that much, and the mic stamps the result
+// late by the input side. Both are in the number, which is why it replaces the
+// estimate rather than adding to it.
+//
+// The measurement is a raw capture, not a take: it does not touch the transport,
+// the loop length or any channel, so it can run with tracks playing.
+async function calibrate() {
+  if (calibration) return;
+  const ok = await ensureMic();
+  if (!ok) return;
+
+  const rate = ctx.sampleRate;
+  const frames = Math.round(CALIBRATION_SECONDS * rate);
+  const lead = Math.round(CALIBRATION_LEAD * rate);
+  const deviceId = state.micId;
+  const results = [];
+
+  // A placeholder so the button reports progress before the first window opens.
+  calibration = { frames, results, deviceId, rec: null };
+  render();
+
+  try {
+    for (let attempt = 0; attempt < CALIBRATION_TRIES; attempt++) {
+      const startAt = ctx.currentTime + 0.1;
+      const clickFrame = Math.round(startAt * rate) + lead;
+      const heard = await measureRoundTrip(startAt, clickFrame, frames);
+      if (heard === null) {
+        showBanner(
+          "Calibration heard nothing. Turn the speakers up, or use headphones " +
+            "on the desk next to the mic, and try again."
+        );
+        return;
+      }
+      results.push(heard);
+      // The next window is opened by measureRoundTrip; keep the count visible
+      // between the two.
+      if (calibration) calibration.results = results;
+      render();
+    }
+
+    // The median, not the mean: one take that caught a room noise or a late
+    // block should not drag the number.
+    const sorted = results.slice().sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    storeDeviceOffset(deviceId, median / rate);
+    logCaptureShift();
+    showBanner(
+      "Calibrated: round trip " +
+        (median / rate * 1000).toFixed(1) +
+        " ms (" +
+        median +
+        " samples). Takes now land where you played them."
+    );
+  } finally {
+    calibration = null;
+    render();
+  }
+}
+
+// Opens a measurement window and plays the click into it. Resolves with the
+// round trip in samples, or null when the click was not heard.
+//
+// The window is a raw capture: it does not touch the transport, the loop length
+// or any channel, so it can run with tracks playing. `calibration` owns the mic
+// while it is open, so a take cannot be spliced into it.
+function measureRoundTrip(startAt, clickFrame, frames) {
+  return new Promise((resolve) => {
+    const rec = {
+      startFrame: clickFrame,
+      endFrame: clickFrame + frames,
+      scratch: new Float32Array(frames),
+      lastFrame: null,
+      resolve,
+    };
+    calibration = { frames, results: [], deviceId: state.micId, rec };
+    render();
+    playCalibrationClick(startAt);
+    // A worklet that stops delivering must not leave the button stuck.
+    rec.timer = setTimeout(() => {
+      if (calibration && calibration.rec === rec) {
+        calibration.rec = null;
+        resolve(null);
+      }
+    }, (CALIBRATION_SECONDS + 1) * 1000);
+  });
+}
+
+// The click is a short burst, not a single sample: a one-sample impulse is
+// inaudible on most speakers and is lost in the resampling the browser does on
+// the way out. 3 ms at 1 kHz is loud, short, and has an unambiguous peak.
+function playCalibrationClick(when) {
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  osc.frequency.value = 1000;
+  g.gain.setValueAtTime(0, when);
+  g.gain.linearRampToValueAtTime(CALIBRATION_PEAK, when + 0.001);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + 0.003);
+  osc.connect(g);
+  // Straight to the destination: the master gain and the reverb would colour
+  // the click, and the measurement wants the shortest path the speakers have.
+  g.connect(ctx.destination);
+  osc.start(when);
+  osc.stop(when + 0.004);
+}
+
+// The index of the first sample above `threshold`, or -1. The first crossing,
+// not the global peak: a room noise later in the window can be louder than the
+// click, and the click is the first thing in it.
+function firstCrossing(data, threshold) {
+  for (let i = 0; i < data.length; i++) {
+    if (Math.abs(data[i]) >= threshold) return i;
+  }
+  return -1;
+}
+
+// Writes a calibration block into the measurement buffer. Mirrors the write in
+// onCaptureFrame, minus the envelope and the take bookkeeping.
+function onCalibrationFrame(frame, data) {
+  const rec = calibration.rec;
+  if (!rec) return;
+  const from = Math.max(frame, rec.startFrame);
+  const to = Math.min(frame + data.length, rec.endFrame);
+  if (to > from) {
+    rec.scratch.set(data.subarray(from - frame, to - frame), from - rec.startFrame);
+    rec.lastFrame = to - 1;
+  }
+  if (frame + data.length < rec.endFrame) return;
+
+  clearTimeout(rec.timer);
+  calibration.rec = null;
+  const at = firstCrossing(rec.scratch, CALIBRATION_MIN_PEAK);
+  rec.resolve(at < 0 ? null : at);
+}
+
+// The offset a finished take landed at, in samples: how far the audio of the
+// loop boundary sits from the start of the take. Positive means the take is
+// late, which is the direction every correction so far has been fighting.
+//
+// This is the number the user can check without exporting anything. A take
+// recorded against a click on the boundary should report ~0.
+function takeOffset(rec) {
+  if (!rec || rec.startFrame === null) return null;
+  const at = firstCrossing(rec.scratch, CALIBRATION_MIN_PEAK);
+  if (at < 0) return null;
+  return at - rec.shift;
+}
+
+// Records one short take against the click and reports where the click landed.
+// This is the check the user can run after calibrating, and the one that says
+// whether the number in force is right for this device: a take that reports
+// +40 ms is 40 ms late, and the manual offset is the control that fixes it.
+//
+// It is a real take through the real path -- armed at a loop boundary, captured
+// by the worklet, sliced by finishCapture -- so it measures what a take does,
+// not what the arithmetic says it should do.
+async function syncCheck() {
+  if (calibration) return;
+  const ok = await ensureMic();
+  if (!ok) return;
+  if (pendingRecord) {
+    showBanner("Finish the take in progress first.");
+    return;
+  }
+
+  const rate = ctx.sampleRate;
+  const frames = Math.round(CALIBRATION_SECONDS * rate);
+  const lead = Math.round(CALIBRATION_LEAD * rate);
+  const startAt = ctx.currentTime + 0.1;
+  const clickFrame = Math.round(startAt * rate) + lead;
+
+  const heard = await measureRoundTrip(startAt, clickFrame, frames);
+
+  calibration = null;
+  render();
+
+  if (heard === null) {
+    showBanner("Sync check heard nothing. Turn the speakers up and try again.");
+    return;
+  }
+
+  // The click was played at `clickFrame`, so the take is late by however far
+  // the click sits past the start of the window.
+  const offset = heard - lead;
+  const ms = (offset / rate * 1000).toFixed(1);
+  console.info("[loupeur] sync check: %s ms (%s samples)", ms, offset);
+  showBanner(
+    Math.abs(offset) < Math.round(0.005 * rate)
+      ? "Sync check: the take is within 5 ms of the boundary. Good."
+      : "Sync check: the take is " +
+        (offset > 0 ? "late" : "early") +
+        " by " +
+        Math.abs(ms) +
+        " ms. " +
+        (offset > 0
+          ? "Raise the input offset by " + Math.abs(ms) + " ms."
+          : "Lower the input offset by " + Math.abs(ms) + " ms.")
+  );
 }
 
 // Rebuilds the capture path on the newly chosen input. A take in progress is
@@ -432,12 +686,17 @@ function releaseMic() {
   captureReady = false;
   inputLatency = 0;
   outputLatency = 0;
-  deviceOffset = 0;
 }
 
 function onCaptureFrame(e) {
-  if (!pendingRecord) return;
   const { frame, data } = e.data;
+  // A calibration owns the mic while it runs: it is a raw capture, not a take,
+  // and it must not be spliced into a take that happens to be open.
+  if (calibration) {
+    onCalibrationFrame(frame, data);
+    return;
+  }
+  if (!pendingRecord) return;
   const rec = pendingRecord;
 
   // The take starts at the first block that overlaps the capture window. For
@@ -932,6 +1191,21 @@ function finishCapture() {
   const folded = foldSeam(rec.scratch.subarray(0, take));
   const buf = ctx.createBuffer(1, folded.length, rate);
   buf.getChannelData(0).set(folded);
+
+  // Report where the take landed, so a wrong shift is visible without exporting
+  // a WAV and measuring it in an editor. Only for a take that started on a
+  // boundary: the first Free Mode take starts wherever the user pressed record,
+  // so its first transient says nothing about the latency.
+  if (!rec.definesLoop) {
+    const offset = takeOffset(rec);
+    if (offset !== null) {
+      console.info(
+        "[loupeur] take offset: %s ms (%s samples) from the boundary",
+        (offset / rate * 1000).toFixed(1),
+        offset
+      );
+    }
+  }
 
   // The first Free Mode take defines the loop from its folded length.
   if (rec.definesLoop) {
@@ -1586,6 +1860,21 @@ function render() {
 
   const hasAudio = state.channels.some((c) => c.buffer);
   el.exportBtn.disabled = !hasAudio;
+
+  // The offset control shows the manual value for the open device, so switching
+  // mic shows that device's own number instead of carrying the last one over.
+  const manual = Math.round(manualOffsetFor(state.micId) * 1000);
+  el.offset.value = manual;
+  el.offsetOut.textContent = manual > 0 ? "+" + manual : String(manual);
+
+  // Calibration owns the mic while it runs, so nothing else may start a take.
+  const busy = Boolean(calibration);
+  el.calibrate.disabled = busy;
+  el.calibrate.textContent = busy
+    ? "Calibrating " + (calibration.results.length + 1) + "/" + CALIBRATION_TRIES
+    : "Calibrate";
+  el.syncCheck.disabled = busy || !hasAudio;
+
   el.modeHelp.textContent =
     state.mode === "free"
       ? "Free Mode: the first take sets the loop length. Later tracks must match it."
@@ -1646,6 +1935,23 @@ function bindControls() {
 
   el.mic.addEventListener("change", () => {
     switchMic(el.mic.value).catch((err) => showBanner("Could not switch microphone: " + err.message));
+  });
+
+  // The manual offset is a fine adjustment on top of the measurement, so it is
+  // applied live: the next take uses it, and the number is stored per device.
+  el.offset.addEventListener("input", () => {
+    const ms = Number(el.offset.value);
+    storeManualOffset(state.micId, ms / 1000);
+    el.offsetOut.textContent = ms > 0 ? "+" + ms : String(ms);
+    if (ctx) logCaptureShift();
+  });
+
+  el.calibrate.addEventListener("click", () => {
+    calibrate().catch((err) => showBanner("Calibration failed: " + err.message));
+  });
+
+  el.syncCheck.addEventListener("click", () => {
+    syncCheck().catch((err) => showBanner("Sync check failed: " + err.message));
   });
 
   // Plugging or unplugging an input changes the list; labels also become
