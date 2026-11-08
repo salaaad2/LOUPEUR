@@ -107,11 +107,27 @@ body {
 
 .panel:hover { box-shadow: var(--nb-shadow); transform: none; }
 
-.controls,
+/* The controls panel is a grid, not a wrapping flex row. A flex row aligned
+   its items on their bottom edge, so every label sat wherever its widget
+   happened to end: the slider's label rode high, the select's rode low. A
+   grid puts all the labels on one line and all the widgets on the next.
+   auto-fit keeps the columns at least as wide as the longest label
+   ("Click while recording"), so no label wraps and pushes its widget down. */
+.controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  align-items: start;
+  gap: 18px 26px;
+}
+
+/* Same alignment rule as the controls panel: the labels share a line and the
+   widgets share the next. Stretch is what does it — each control fills the
+   line's height, so its label starts at the top instead of wherever its
+   widget happened to end. flex-end put Reverb's label 16px above Master's. */
 .output {
   display: flex;
   flex-direction: row;
-  align-items: flex-end;
+  align-items: stretch;
   gap: 26px;
   flex-wrap: wrap;
 }
@@ -160,6 +176,10 @@ input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
   width: 100%;
+  /* The UA gives range inputs a 2px margin. It was invisible while the row
+     aligned on widget bottoms; now it would drop the slider 2px below the
+     selects and checkboxes beside it. */
+  margin: 0;
   height: 10px;
   border: 2px solid var(--line);
   border-radius: 0;
@@ -222,13 +242,54 @@ select option,
 }
 
 /* Device labels are long ("Headset Microphone (Bluetooth)"), so the picker
-   gets a wider column and truncates instead of stretching the panel. */
+   truncates instead of widening its column. */
 #mic {
-  max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* In the controls grid a select fills its column, so the row reads as a grid
+   of equal cells instead of a ragged line of content-sized widgets. */
+.control select { width: 100%; }
+
+/* --------------------------------------------------------------------------
+   Buttons (.nb-button)
+   -------------------------------------------------------------------------- */
+
+/* index.min.css only styles the colour variants (.nb-button.default and
+   friends), so a bare .nb-button falls back to the browser's own button: Arial,
+   weight 400, sentence case, default cursor. This is the base every .nb-button
+   wears, typography included, so it matches the track buttons and Export. The
+   mode pair adds only its layout. */
+.nb-button {
+  padding: 8px 14px;
+  font-family: var(--nb-font);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  background: var(--panel-2);
+  color: var(--dim);
+  border: 2px solid var(--line);
+  box-shadow: var(--nb-shadow-sm);
+}
+
+.nb-button:hover,
+.nb-button:focus {
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 2px 2px 0 var(--line);
+  transform: translate(2px, 2px);
+}
+
+.nb-button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.nb-button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* --------------------------------------------------------------------------
    Mode toggle (.nb-button pair)
@@ -238,30 +299,6 @@ select option,
   display: inline-flex;
   gap: 8px;
 }
-
-.segmented .nb-button {
-  padding: 8px 14px;
-  font-size: 11px;
-  background: var(--panel-2);
-  color: var(--dim);
-  border: 2px solid var(--line);
-  box-shadow: var(--nb-shadow-sm);
-}
-
-.segmented .nb-button:hover,
-.segmented .nb-button:focus {
-  background: var(--panel-2);
-  color: var(--text);
-  box-shadow: 2px 2px 0 var(--line);
-  transform: translate(2px, 2px);
-}
-
-.segmented .nb-button.on {
-  background: var(--accent);
-  color: #fff;
-}
-
-.segmented .nb-button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* --------------------------------------------------------------------------
    Checkboxes (.nb-checkbox)

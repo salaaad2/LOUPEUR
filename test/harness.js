@@ -38,7 +38,6 @@ const EXPORTS = [
   "startTransport",
   "nextBoundaryTime",
   "calibrate",
-  "syncCheck",
   "measureRoundTrip",
   "onCalibrationFrame",
   "firstCrossing",

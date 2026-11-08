@@ -150,13 +150,18 @@ zero. A silent room must not be stored as "this device has no latency".
 `onCaptureFrame` hands every block to `onCalibrationFrame` and returns, so a
 measurement can never be spliced into a take that happens to be open.
 
-### One offset, and the slider is it
+### One offset, and calibration is the only writer
 
 There is exactly one number per device, stored under `loupeur.offset.v1` and
-read by `offsetFor()`. Calibration writes it, the `#offset` slider writes it,
-and `captureShift()` reads it. `render()` shows it in the slider and the
-readout, and the help line under the slider says whether it is measured or still
-the estimate.
+read by `offsetFor()`. Calibration writes it and `captureShift()` reads it.
+`render()` shows it in the readout next to the Latency label, and the help line
+under it says whether it is measured or still the estimate.
+
+The number is **not** editable. It is a measurement of the device, not a
+preference: a hand-set value is a guess the user has no way to verify, and the
+only thing that can produce a correct one is playing a burst and hearing it
+back. The readout exists so the measurement is visible, not so it can be
+overridden.
 
 An earlier version kept two numbers: a measured round trip and a separate manual
 offset added on top. That was wrong for a reason that has nothing to do with
@@ -170,24 +175,8 @@ The offset applies to **every** take on **every** track, including the first
 one. It is a property of the input device, not of the take: `armCapture` reads
 it when the window opens, and every window opens through `armCapture`.
 
-The slider may go negative, and `captureShift()` clamps the result at zero: a
-negative shift would open the window after the boundary and lose the head of the
-take. A take that lands early is as wrong as one that lands late, so the
-correction has to be able to subtract.
-
-### The sync check
-
-`syncCheck()` runs the same measurement and compares it to the offset in force.
-The residual is `measured - offsetFor(device)`: positive means the offset is
-short and the take still lands late. It is the same raw capture as `calibrate`,
-not a take through `finishCapture`, so it measures the device rather than the
-take path.
-
-It then **corrects the offset itself** and says so: "the offset was short by
-40 ms, the input offset is now 240 ms". Reporting "raise the offset by 40 ms"
-and leaving the user to move a slider was the step where the previous version
-lost them; the measurement is the residual, so adding it to the offset is the
-fix and there is no reason to make the user do it.
+`captureShift()` clamps the result at zero: a negative shift would open the
+window after the boundary and lose the head of the take.
 
 `finishCapture` also logs `[loupeur] take offset: … ms` for every take that
 started on a boundary, so a wrong shift is visible in the console without

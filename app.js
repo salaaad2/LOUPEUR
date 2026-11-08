@@ -103,10 +103,8 @@ const el = {
   exportBtn: document.getElementById("export"),
   modeHelp: document.getElementById("modeHelp"),
   calibrate: document.getElementById("calibrate"),
-  offset: document.getElementById("offset"),
   offsetOut: document.getElementById("offsetOut"),
   offsetHelp: document.getElementById("offsetHelp"),
-  syncCheck: document.getElementById("syncCheck"),
 };
 
 // ---------------------------------------------------------------------------
@@ -297,11 +295,11 @@ function measureOutputLatency() {
 // The offset a take is displaced by, in seconds: how far the audio of a sound
 // the player meant for a given render frame is stamped from that frame.
 //
-// There is exactly one number, and it is the one the slider shows. Calibration
-// does not keep a separate hidden measurement that the slider is added to: it
-// writes its result into the same per-device offset the slider edits. Two
+// There is exactly one number, and it is the one the readout shows. Calibration
+// does not keep a separate hidden measurement that the readout is added to: it
+// writes its result into the same per-device offset the readout displays. Two
 // numbers meant the user could not tell what was in force, and a calibration
-// that "did nothing" because the slider still read 0.
+// that "did nothing" because the readout still said 0.
 //
 // Before any calibration the offset falls back to the reported buffers, which
 // is a lower bound: it cannot see buffering the browser does not report -- a
@@ -313,7 +311,7 @@ function captureShift() {
 }
 
 // The offset in force for a device, in seconds. One stored number per device,
-// written by the slider and by calibration alike.
+// written by calibration and read by everything else.
 function offsetFor(deviceId) {
   const stored = loadStore(OFFSET_KEY)[deviceId || ""];
   if (typeof stored === "number" && isFinite(stored)) return stored;
@@ -474,7 +472,7 @@ async function calibrate() {
       return;
     }
 
-    // The measurement replaces the offset outright, and the slider is the same
+    // The measurement replaces the offset outright, and the readout is the same
     // number: it is written here so the control shows what is in force instead
     // of staying at 0 while a hidden value does the work.
     storeDeviceOffset(deviceId, delay / ctx.sampleRate);
@@ -679,73 +677,6 @@ function takeOffset(rec) {
   const at = firstCrossing(rec.scratch, TAKE_MIN_PEAK);
   if (at < 0) return null;
   return at;
-}
-
-// Measures the round trip again and compares it to the offset in force. This is
-// the check the user can run after calibrating, and the one that says whether
-// the number in force is right for this device: an offset that is 40 ms short
-// leaves every take 40 ms late.
-//
-// It corrects the offset itself instead of telling the user to do the
-// arithmetic. The measurement is the residual error of the offset in force, so
-// adding it to that offset is the fix, and the slider then shows the corrected
-// number. Reporting "raise it by 40 ms" and leaving the user to move a slider
-// was the step where the previous version lost them.
-//
-// It is the same raw capture as calibrate, not a take through finishCapture, so
-// it measures the device rather than the take path.
-async function syncCheck() {
-  if (calibration) return;
-  const ok = await ensureMic();
-  if (!ok) return;
-  if (pendingRecord) {
-    showBanner("Finish the take in progress first.");
-    return;
-  }
-
-  const rate = ctx.sampleRate;
-  calibration = { rec: null };
-  render();
-
-  let measured;
-  try {
-    measured = await measureRoundTrip();
-  } finally {
-    calibration = null;
-    render();
-  }
-
-  if (measured === null) {
-    showBanner("Sync check heard nothing. Turn the speakers up and try again.");
-    return;
-  }
-
-  // The measurement is the round trip the device actually has; the offset in
-  // force is what the app is correcting by. The residual is the difference, so
-  // a positive number means the take still lands late.
-  const before = offsetFor(state.micId);
-  const residual = measured - Math.round(before * rate);
-  const ms = (residual / rate * 1000).toFixed(1);
-  console.info("[loupeur] sync check: %s ms (%s samples)", ms, residual);
-
-  if (Math.abs(residual) < Math.round(0.005 * rate)) {
-    showBanner("Sync check: the offset is within 5 ms of the measured round trip. Good.");
-    return;
-  }
-
-  const after = Math.max(0, before + residual / rate);
-  storeDeviceOffset(state.micId, after);
-  logCaptureShift();
-  render();
-  showBanner(
-    "Sync check: the offset was " +
-      (residual > 0 ? "short" : "long") +
-      " by " +
-      Math.abs(ms) +
-      " ms. The input offset is now " +
-      Math.round(after * 1000) +
-      " ms. Record a take to confirm."
-  );
 }
 
 // Rebuilds the capture path on the newly chosen input. A take in progress is
@@ -1977,12 +1908,11 @@ function render() {
   const hasAudio = state.channels.some((c) => c.buffer);
   el.exportBtn.disabled = !hasAudio;
 
-  // The offset control shows the number actually in force for the open device:
+  // The offset readout shows the number actually in force for the open device:
   // the measured one once calibration has run, the estimate before that. It is
-  // the same number captureShift() uses, so what the slider reads is what the
-  // next take is corrected by -- there is no second hidden value.
+  // the same number captureShift() uses, so what it reads is what the next take
+  // is corrected by -- there is no second hidden value, and nothing to edit.
   const offsetMs = Math.round(captureShift() * 1000);
-  el.offset.value = offsetMs;
   el.offsetOut.textContent = offsetMs > 0 ? "+" + offsetMs : String(offsetMs);
   el.offsetHelp.textContent = offsetIsMeasured(state.micId)
     ? "Measured for this microphone. Applies to every take, on every track."
@@ -1992,7 +1922,6 @@ function render() {
   const busy = Boolean(calibration);
   el.calibrate.disabled = busy;
   el.calibrate.textContent = busy ? "Calibrating…" : "Calibrate";
-  el.syncCheck.disabled = busy || !hasAudio;
 
   el.modeHelp.textContent =
     state.mode === "free"
@@ -2056,24 +1985,8 @@ function bindControls() {
     switchMic(el.mic.value).catch((err) => showBanner("Could not switch microphone: " + err.message));
   });
 
-  // The slider edits the offset in force, which is the same number calibration
-  // writes. Moving it is a manual correction on top of a measurement, or a
-  // by-ear correction before one has been taken; either way it is stored per
-  // device and the next take uses it.
-  el.offset.addEventListener("input", () => {
-    const ms = Number(el.offset.value);
-    storeDeviceOffset(state.micId, ms / 1000);
-    el.offsetOut.textContent = ms > 0 ? "+" + ms : String(ms);
-    el.offsetHelp.textContent = "Set by hand for this microphone. Applies to every take, on every track.";
-    if (ctx) logCaptureShift();
-  });
-
   el.calibrate.addEventListener("click", () => {
     calibrate().catch((err) => showBanner("Calibration failed: " + err.message));
-  });
-
-  el.syncCheck.addEventListener("click", () => {
-    syncCheck().catch((err) => showBanner("Sync check failed: " + err.message));
   });
 
   // Plugging or unplugging an input changes the list; labels also become

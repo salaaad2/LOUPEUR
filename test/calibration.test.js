@@ -112,13 +112,13 @@ tests.push({
   },
 });
 
-// There is one offset per device, and it is the number the slider shows. A
-// calibration writes it, the slider writes it, and captureShift() reads it. A
-// second hidden measurement the slider was added to meant the user could not
-// tell what was in force, and a calibration that left the slider at 0 looked
-// like it had done nothing.
+// There is one offset per device, and it is the number the readout shows. A
+// calibration writes it and captureShift() reads it. A second hidden
+// measurement the readout was added to meant the user could not tell what was
+// in force, and a calibration that left the readout at 0 looked like it had
+// done nothing.
 tests.push({
-  name: "offset: calibration and the slider write the same number",
+  name: "offset: a stored measurement replaces the estimate",
   async fn() {
     const t = load({ sampleRate: RATE });
     await boot(t);
@@ -134,10 +134,9 @@ tests.push({
     assert.ok(Math.abs(t.captureShift() - 0.2) < 1e-9, "the measurement did not take effect");
     assert.strictEqual(t.offsetIsMeasured(""), true, "a measurement did not report as measured");
 
-    // What the slider writes: the same store, so it replaces the measurement
-    // rather than being added to it.
+    // A second measurement replaces the first rather than being added to it.
     t.storeDeviceOffset("", 0.23);
-    assert.ok(Math.abs(t.captureShift() - 0.23) < 1e-9, "the slider value did not take effect");
+    assert.ok(Math.abs(t.captureShift() - 0.23) < 1e-9, "the second measurement did not take effect");
 
     // A negative offset is a real correction: a take that lands early is as
     // wrong as one that lands late.
@@ -165,19 +164,17 @@ tests.push({
   },
 });
 
-// The slider must show the number in force, not a separate manual value. This
-// is the bug the user hit: calibrate ran, stored a measurement, and the slider
-// still read 0, so there was no way to tell whether anything had happened.
+// The readout must show the number in force, not a separate manual value. This
+// is the bug the user hit: calibrate ran, stored a measurement, and the readout
+// still said 0, so there was no way to tell whether anything had happened.
 tests.push({
-  name: "offset: the slider shows the number in force after a calibration",
+  name: "offset: the readout shows the number in force after a calibration",
   async fn() {
     const t = load({ sampleRate: RATE });
     await boot(t);
     t.storeDeviceOffset("", 0.24);
     t.render();
-    const slider = t.__document.getElementById("offset");
     const out = t.__document.getElementById("offsetOut");
-    assert.strictEqual(Number(slider.value), 240, "the slider did not show the measured offset");
     assert.strictEqual(out.textContent, "+240", "the readout did not show the measured offset");
   },
 });
@@ -223,41 +220,6 @@ tests.push({
       "the boundary's audio was not captured at the head of the take"
     );
     assert.strictEqual(t.takeOffset(rec), 0, "the take did not report as on the boundary");
-  },
-});
-
-// The sync check measures the round trip and compares it to the offset in
-// force. A positive residual means the offset is short, and the check corrects
-// it itself rather than telling the user to do the arithmetic.
-tests.push({
-  name: "sync check: a short offset is reported and corrected",
-  async fn() {
-    const t = load({ sampleRate: RATE });
-    await boot(t);
-    // The offset in force is 200 ms; the device actually has 240 ms.
-    t.storeDeviceOffset("", 0.2);
-    const roundTrip = Math.round(0.24 * RATE);
-
-    const pending = t.syncCheck();
-    for (let i = 0; i < 50 && !(t.calibration && t.calibration.rec); i++) {
-      await Promise.resolve();
-    }
-    const rec = t.calibration && t.calibration.rec;
-    assert.ok(rec, "the sync check did not open a window");
-    feedBursts(t, rec, roundTrip);
-    await pending;
-
-    // The banner is the report; the console line carries the number. Read the
-    // banner, which is what the user sees.
-    const banner = t.__document.getElementById("banner");
-    assert.ok(
-      /short by 40/.test(banner.textContent),
-      "the sync check did not report the residual: " + banner.textContent
-    );
-    assert.ok(
-      Math.abs(t.offsetFor("") - 0.24) < 1e-9,
-      "the sync check did not correct the offset: " + t.offsetFor("")
-    );
   },
 });
 

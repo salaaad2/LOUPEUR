@@ -95,9 +95,9 @@ latency of the hardware:
 
 The calibration tests cover the measurement itself: a known round trip comes back
 as that round trip, silence is reported as no measurement rather than as zero,
-one bad burst does not move the robust estimate, calibration and the slider write
-the same per-device number, the slider shows the number in force, and the sync
-check corrects a short offset by the amount it is short.
+one bad burst does not move the robust estimate, a stored measurement replaces
+the estimate, the offset is stored per device, and the readout shows the number
+in force.
 
 They assert internal consistency, not an absolute offset, which is why they hold
 on any device. Anything involving real capture, scheduling or rendering still
@@ -112,7 +112,7 @@ needs a browser and a microphone.
 - Latency compensation is only as good as the calibration. Until you run
   **Calibrate**, the shift falls back to the device's reported input latency plus
   `outputLatency`, which is a lower bound: a phone used as a mic over ADB or a
-  Bluetooth bridge still lands late. Run **Calibrate** once per microphone, then
-  **Sync check** to confirm. The offset applies to every take on every track,
-  including the first one, and the slider always shows the number in force.
+  Bluetooth bridge still lands late. Run **Calibrate** once per microphone. The
+  offset applies to every take on every track, including the first one, and the
+  readout next to the Latency label always shows the number in force.
 - Export renders one loop plus a 1 s reverb tail, trimmed to the loop length.
