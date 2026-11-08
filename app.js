@@ -87,6 +87,7 @@ let pendingRecord = null;    // the take in progress, see armCapture
 let liveEnv = null;          // envelope of the take in progress, for the waveform
 let countInOscs = [];        // clicks of a count-in that has not finished yet
 let calibration = null;      // the round-trip measurement in progress, see calibrate
+let exportingStems = false;  // a folder export is running, see exportStems
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -106,6 +107,7 @@ const el = {
   master: document.getElementById("master"),
   masterOut: document.getElementById("masterOut"),
   exportBtn: document.getElementById("export"),
+  stems: document.getElementById("stems"),
   modeHelp: document.getElementById("modeHelp"),
   calibrate: document.getElementById("calibrate"),
   offsetOut: document.getElementById("offsetOut"),
@@ -1517,14 +1519,12 @@ function playClick(when, accent, cancellable = true) {
 // Export
 // ---------------------------------------------------------------------------
 
-async function exportMix() {
-  const active = state.channels.filter((c) => c.buffer && !c.muted);
-  if (!active.length) {
-    showBanner("Nothing to export. Record a loop first.");
-    return;
-  }
-
-  const L = active[0].buffer.length;
+// Renders `channels` through the export graph: per-track level, reverb send,
+// master. One loop plus the reverb tail, trimmed to the loop length. The mix
+// export and the stems both come through here, so a stem is exactly the track's
+// contribution to the mix.
+async function renderChannels(channels) {
+  const L = channels[0].buffer.length;
   const rate = ctx.sampleRate;
   const tail = Math.round(EXPORT_TAIL * rate);
   const offline = new OfflineAudioContext(2, L + tail, rate);
@@ -1544,7 +1544,7 @@ async function exportMix() {
   conv.connect(wet);
   wet.connect(master);
 
-  for (const ch of active) {
+  for (const ch of channels) {
     const src = offline.createBufferSource();
     src.buffer = ch.buffer;
     // The per-track level is part of the mix, so the render has to apply it: an
@@ -1558,8 +1558,82 @@ async function exportMix() {
   }
 
   const rendered = await offline.startRendering();
-  const wav = encodeWav(rendered, L);
-  download(wav, "loop-mix.wav");
+  return encodeWav(rendered, L);
+}
+
+async function exportMix() {
+  const active = state.channels.filter((c) => c.buffer && !c.muted);
+  if (!active.length) {
+    showBanner("Nothing to export. Record a loop first.");
+    return;
+  }
+  download(await renderChannels(active), "loop-mix.wav");
+}
+
+// The tracks that get a file, and the name each one gets. Numbered by track, not
+// by position in the list: clearing track 2 must not renumber track 3, so
+// track3.wav is the third track whether or not the second one exists.
+function stemFiles(channels) {
+  return channels
+    .filter((c) => c.buffer)
+    .map((c) => ({ channel: c, name: `track${c.index + 1}.wav` }));
+}
+
+// Brave ships the File System Access API turned off, so the picker is missing
+// even though the engine has it. Naming the flag is the only way the user gets
+// the folder path back; the downloads below work either way.
+function folderPickerHint() {
+  return navigator.brave
+    ? "Brave turns the folder picker off by default: enable brave://flags/#file-system-access-api and restart."
+    : "This browser has no folder picker.";
+}
+
+// The fallback for a browser without the picker: the same files, one download
+// each. Same names, same numbering, so the two paths cannot drift apart.
+async function downloadStems(files) {
+  for (const file of files) {
+    download(await renderChannels([file.channel]), file.name);
+  }
+}
+
+// One file per track that holds audio, written into a folder the user picks.
+// Mute is not applied: it is a performance state, and the file is the material.
+// The level, the reverb send and master are, so the stems sum to the mix.
+async function exportStems() {
+  const files = stemFiles(state.channels);
+  if (!files.length) {
+    showBanner("Nothing to export. Record a loop first.");
+    return;
+  }
+
+  const count = `${files.length} track${files.length > 1 ? "s" : ""}`;
+
+  // No picker is not a reason to refuse: a browser that cannot write to a
+  // folder can still hand the user the same files through the download path.
+  if (!window.showDirectoryPicker) {
+    await downloadStems(files);
+    showBanner(`Saved ${count} as downloads. ${folderPickerHint()}`);
+    return;
+  }
+
+  let dir;
+  try {
+    dir = await window.showDirectoryPicker({ mode: "readwrite" });
+  } catch (err) {
+    // Cancelling the picker is not a failure worth a banner.
+    if (err && err.name === "AbortError") return;
+    throw err;
+  }
+
+  for (const file of files) {
+    const wav = await renderChannels([file.channel]);
+    const handle = await dir.getFileHandle(file.name, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(wav);
+    await writable.close();
+  }
+
+  showBanner(`Saved ${count} to ${dir.name}.`);
 }
 
 function encodeWav(buffer, frames) {
@@ -1959,6 +2033,9 @@ function render() {
 
   const hasAudio = state.channels.some((c) => c.buffer);
   el.exportBtn.disabled = !hasAudio;
+  // The stems checkbox is an action, not a mode: it is only live while there is
+  // something to write and no export is already running.
+  el.stems.disabled = exportingStems || !hasAudio;
 
   // The offset readout shows the number actually in force for the open device:
   // the measured one once calibration has run, the estimate before that. It is
@@ -1967,7 +2044,7 @@ function render() {
   const offsetMs = Math.round(captureShift() * 1000);
   el.offsetOut.textContent = offsetMs > 0 ? "+" + offsetMs : String(offsetMs);
   el.offsetHelp.textContent = offsetIsMeasured(state.micId)
-    ? "Measured for this microphone. Applies to every take, on every track."
+    ? "Measured for this microphone."
     : "Estimated from the browser's reported buffers. Run Calibrate to measure it.";
 
   // Calibration owns the mic while it runs, so nothing else may start a take.
@@ -2073,6 +2150,22 @@ function bindControls() {
 
   el.exportBtn.addEventListener("click", () => {
     exportMix().catch((err) => showBanner("Export failed: " + err.message));
+  });
+
+  // Checking the box is the whole gesture: it opens the folder picker, writes
+  // the stems and unchecks itself, so a second export is one click away and a
+  // cancelled picker leaves the box clear.
+  el.stems.addEventListener("change", () => {
+    if (!el.stems.checked) return;
+    exportingStems = true;
+    render();
+    exportStems()
+      .catch((err) => showBanner("Export failed: " + err.message))
+      .finally(() => {
+        exportingStems = false;
+        el.stems.checked = false;
+        render();
+      });
   });
 
   document.addEventListener("keydown", (e) => {

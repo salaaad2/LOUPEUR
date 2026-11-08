@@ -58,6 +58,8 @@ const EXPORTS = [
   "setVolume",
   "toggleMute",
   "clearChannel",
+  "stemFiles",
+  "exportStems",
 ];
 
 // Names are probed with typeof so the harness still loads against a version of
@@ -75,6 +77,9 @@ function exportBlock() {
     "set inputLatency(v) { inputLatency = v; }",
     "set outputLatency(v) { outputLatency = v; }",
     "set pendingRecord(v) { pendingRecord = v; }",
+    // The export path hands its bytes to download(); a test that wants to see
+    // the files replaces it instead of touching the DOM.
+    "set download(v) { download = v; }",
   ];
   const probes = EXPORTS.map(
     (name) => `${name}: typeof ${name} === "undefined" ? undefined : ${name}`
@@ -165,6 +170,9 @@ function makeContext(opts) {
     },
     createMediaStreamSource: () => makeNode(),
     audioWorklet: { addModule: async () => {} },
+    // The export renders offline. The stub returns a silent buffer, which is all
+    // encodeWav reads: the samples are not what the export tests assert on.
+    startRendering: async () => makeAudioBuffer(2, 4800, rate),
   };
   Object.defineProperty(ctx, "currentTime", { get: () => clock.now });
   ctx.__clock = clock;

@@ -43,6 +43,7 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | Microphone | Input picker; `Default input` follows the system default |
 | Reverb / Master | Global send and output level |
 | Export Mix | Renders the unmuted tracks to a 16-bit stereo WAV |
+| Export tracks separately | One `track{n}.wav` per track that holds audio, into a folder you pick, or as downloads where the folder picker is unavailable |
 
 Keyboard: `R` record/punch on the selected track, `1`–`4` select a track,
 `Space` stop/resume.
@@ -104,6 +105,10 @@ The level tests cover the per-track gain: the slider sets it, mute overrides it,
 a volume move during a pending mute lands on the mute's boundary, and a cleared
 track comes back at its own level rather than at full scale.
 
+The stem tests cover the selection and the naming: one file per track that holds
+audio, numbered by track so an empty track leaves a gap, a muted track still
+gets a file, and the download fallback used where the folder picker is missing.
+
 They assert internal consistency, not an absolute offset, which is why they hold
 on any device. Anything involving real capture, scheduling or rendering still
 needs a browser and a microphone.
@@ -121,3 +126,9 @@ needs a browser and a microphone.
   offset applies to every take on every track, including the first one, and the
   readout next to the Latency label always shows the number in force.
 - Export renders one loop plus a 1 s reverb tail, trimmed to the loop length.
+- **Export tracks separately prefers a folder, and falls back to downloads.**
+  The folder path uses the File System Access API (`showDirectoryPicker`).
+  Firefox and Safari do not have it, and Brave turns it off by default
+  (`brave://flags/#file-system-access-api`). Without it the checkbox saves the
+  same `track{n}.wav` files as individual downloads, so the names and the
+  numbering are identical either way.

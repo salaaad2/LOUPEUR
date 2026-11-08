@@ -302,6 +302,33 @@ otherwise be lost while the slider still showed it.
 `exportMix()` applies the same number through a gain node per track. An export
 that ignored the sliders would not be the mix the user hears.
 
+## A stem is the mix, one track at a time
+
+`renderChannels()` builds the export graph and is the only place it is built.
+`exportMix()` hands it every unmuted track; `exportStems()` hands it one track
+at a time. A stem therefore carries the same per-track level, reverb send and
+master as the mix, and the stems sum to the mix when nothing is muted.
+
+Mute is not applied to a stem. It is a performance state, not part of the
+material: a track that is muted right now still holds a take worth exporting,
+and the file is the take.
+
+`stemFiles()` numbers by track index, not by position in the list. Clearing
+track 2 must not renumber track 3: `track3.wav` is the third track whether or
+not the second one exists.
+
+The folder write is the File System Access API. Firefox and Safari have no
+`showDirectoryPicker`, and Brave ships it turned off, so a missing picker is not
+a reason to refuse: `downloadStems()` writes the same files through the existing
+download path, and the banner names the Brave flag so the folder path can be
+recovered. The names and the numbering are identical either way, which is what
+makes the fallback a fallback and not a second feature.
+
+The checkbox is the trigger, not a mode: it opens the picker, writes the files
+and unchecks itself, so a second export is one click away and a cancelled picker
+leaves nothing behind. `exportingStems` keeps `render()` from re-enabling the
+box while the writes are in flight.
+
 ## Signal graph
 
 ```
