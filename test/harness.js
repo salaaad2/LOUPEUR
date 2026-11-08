@@ -43,10 +43,11 @@ const EXPORTS = [
   "onCalibrationFrame",
   "firstCrossing",
   "takeOffset",
-  "manualOffsetFor",
-  "storeManualOffset",
+  "offsetFor",
+  "offsetIsMeasured",
   "deviceOffsetFor",
   "storeDeviceOffset",
+  "render",
 ];
 
 // Names are probed with typeof so the harness still loads against a version of

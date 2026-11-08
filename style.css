@@ -141,6 +141,17 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* The one-line explanation under a control. It says what the control does and
+   what it applies to, so a measured number is not mistaken for a guess. */
+.nb-help {
+  margin: 0;
+  max-width: 220px;
+  font-family: var(--nb-font);
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--dim);
+}
+
 /* --------------------------------------------------------------------------
    Range sliders
    -------------------------------------------------------------------------- */

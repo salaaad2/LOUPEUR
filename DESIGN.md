@@ -90,8 +90,7 @@ lands that much late. `captureShift()` is the one place that number comes from:
 
 ```js
 function captureShift() {
-  const base = deviceOffsetFor(state.micId) || inputLatency + outputLatency;
-  return Math.max(0, base + manualOffsetFor(state.micId));
+  return Math.max(0, offsetFor(state.micId));
 }
 ```
 
@@ -123,23 +122,43 @@ stored as "this device has no latency".
 `onCaptureFrame` hands every block to `onCalibrationFrame` and returns, so a
 measurement can never be spliced into a take that happens to be open.
 
-### The manual offset
+### One offset, and the slider is it
 
-The measurement is a number, not a truth. A device can drift, a browser can
-change its buffering, and a user can be playing slightly behind the click. The
-`#offset` slider adds a per-device manual offset on top of the measurement, and
-it may be negative: a take that lands early is as wrong as one that lands late.
-`captureShift()` clamps the sum at zero, because a negative shift would open the
-window after the boundary and lose the head of the take.
+There is exactly one number per device, stored under `loupeur.offset.v1` and
+read by `offsetFor()`. Calibration writes it, the `#offset` slider writes it,
+and `captureShift()` reads it. `render()` shows it in the slider and the
+readout, and the help line under the slider says whether it is measured or still
+the estimate.
+
+An earlier version kept two numbers: a measured round trip and a separate manual
+offset added on top. That was wrong for a reason that has nothing to do with
+arithmetic. The slider showed only the manual half, so after a calibration it
+still read 0 while a hidden value did the work. The user could not tell whether
+calibration had done anything, could not see what was in force, and had no way
+to know whether the number applied to the first take or only later ones. A
+control that does not show the value it controls is worse than no control.
+
+The offset applies to **every** take on **every** track, including the first
+one. It is a property of the input device, not of the take: `armCapture` reads
+it when the window opens, and every window opens through `armCapture`.
+
+The slider may go negative, and `captureShift()` clamps the result at zero: a
+negative shift would open the window after the boundary and lose the head of the
+take. A take that lands early is as wrong as one that lands late, so the
+correction has to be able to subtract.
 
 ### The sync check
 
-`syncCheck()` records one short take against the click and reports where the
-click landed relative to the boundary, in the banner: "late by 40 ms, raise the
-input offset by 40 ms". It goes through the real capture path -- armed at a loop
-boundary, captured by the worklet, sliced by `finishCapture` -- so it measures
-what a take does, not what the arithmetic says it should do. That is the number
-the user reads to decide whether to touch the slider.
+`syncCheck()` records one short take against the click and measures the residual
+error of the offset in force. It goes through the real capture path -- armed at
+a loop boundary, captured by the worklet, sliced by `finishCapture` -- so it
+measures what a take does, not what the arithmetic says it should do.
+
+It then **corrects the offset itself** and says so: "the take was late by 40 ms,
+the input offset is now 240 ms". Reporting "raise the offset by 40 ms" and
+leaving the user to move a slider was the step where the previous version lost
+them; the measurement is the residual, so adding it to the offset is the fix and
+there is no reason to make the user do it.
 
 `finishCapture` also logs `[loupeur] take offset: … ms` for every take that
 started on a boundary, so a wrong shift is visible in the console without
