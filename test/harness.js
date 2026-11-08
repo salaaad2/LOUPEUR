@@ -54,6 +54,10 @@ const EXPORTS = [
   "deviceOffsetFor",
   "storeDeviceOffset",
   "render",
+  "channelTarget",
+  "setVolume",
+  "toggleMute",
+  "clearChannel",
 ];
 
 // Names are probed with typeof so the harness still loads against a version of
@@ -83,12 +87,16 @@ function exportBlock() {
 // ---------------------------------------------------------------------------
 
 function makeParam(value) {
+  // Every automation call is recorded so a test can ask what a param was told
+  // to do and when. `value` stays at its initial value: the stub runs no clock.
+  const calls = [];
   return {
     value,
-    setValueAtTime() {},
-    linearRampToValueAtTime() {},
-    exponentialRampToValueAtTime() {},
-    cancelScheduledValues() {},
+    calls,
+    setValueAtTime(v, t) { calls.push({ type: "set", value: v, time: t }); },
+    linearRampToValueAtTime(v, t) { calls.push({ type: "ramp", value: v, time: t }); },
+    exponentialRampToValueAtTime(v, t) { calls.push({ type: "exp", value: v, time: t }); },
+    cancelScheduledValues(t) { calls.push({ type: "cancel", time: t }); },
   };
 }
 

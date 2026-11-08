@@ -35,6 +35,7 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | Track button | State-dependent: `RECORD` → `IN n` → `STOP REC` → `OVERDUB` → `STOP DUB` |
 | `MUTE` | Per-track mute, ramped at the next loop boundary |
 | `CLEAR` | Long-press (~600 ms) wipes the track |
+| Track volume | Per-track level, applied to playback and to the export |
 | BPM / Bars | Tempo Lock grid: 60–180 BPM, 1/2/4/8 bars |
 | Mode | Free (first take sets the length) or Tempo Lock (grid + count-in) |
 | Click track | Count-in and metronome, Tempo Lock only. Never recorded or exported |
@@ -98,6 +99,10 @@ as that round trip, silence is reported as no measurement rather than as zero,
 one bad burst does not move the robust estimate, a stored measurement replaces
 the estimate, the offset is stored per device, and the readout shows the number
 in force.
+
+The level tests cover the per-track gain: the slider sets it, mute overrides it,
+a volume move during a pending mute lands on the mute's boundary, and a cleared
+track comes back at its own level rather than at full scale.
 
 They assert internal consistency, not an absolute offset, which is why they hold
 on any device. Anything involving real capture, scheduling or rendering still

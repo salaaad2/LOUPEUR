@@ -280,15 +280,37 @@ defines the loop length instead of matching it. `isLockedTake()` is the single
 place that decides whether a take can be punched out; `render()` and `punchOut()`
 both use it so they cannot disagree.
 
+## The channel gain is mute times volume
+
+`channelTarget()` is the only place the two per-track levels are combined:
+`muted ? 0 : state.volumes[index]`. `toggleMute()` and `setVolume()` both write
+the gain through `rampChannelGain()`, so the latch and the slider cannot
+disagree about what the gain should be.
+
+They land at different times on purpose. A mute waits for the next loop
+boundary, because it is a performance move: the track has to drop in and out on
+the beat. The volume slider lands immediately, because it is a mix move, and a
+slider that waits a whole loop reads as broken. `ch.muteAt` remembers a mute
+that is still waiting, so a volume move during the wait is scheduled on the same
+boundary instead of cancelling it and muting early.
+
+`state.volumes` is indexed by track and lives in `state`, not on the channel,
+because the slider has to work before the audio graph exists: the channels are
+created in `initAudio()`, and a level set before the first record would
+otherwise be lost while the slider still showed it.
+
+`exportMix()` applies the same number through a gain node per track. An export
+that ignored the sliders would not be the mix the user hears.
+
 ## Signal graph
 
 ```
 mic → AudioWorklet capture → ring buffer → track buffers (never to destination)
 
-track buffer → BufferSource → channel Gain ─┐
-                                            ├→ master Gain → dry ──────────────┐
-click synth ────────────────────────────────┤                                  ├→ destination
-                                            └→ reverb send → convolver → wet ─┘
+track buffer → BufferSource → channel Gain (mute × volume) ─┐
+                                                            ├→ master Gain → dry ──────────────┐
+click synth ────────────────────────────────────────────────┤                                  ├→ destination
+                                                            └→ reverb send → convolver → wet ─┘
 ```
 
 The click enters after the channel gains and before master, so it is audible but

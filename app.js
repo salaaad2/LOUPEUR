@@ -55,6 +55,11 @@ const state = {
   clickWhileRecording: false,  // metronome keeps ticking under a take
   reverbOn: false,
   master: 0.85,
+  // Per-track level, 0..1, indexed by track. It lives here rather than on the
+  // channel because the slider has to work before the audio graph exists: the
+  // channels are created in initAudio(), and a level set before the first
+  // record would otherwise be lost while the slider still showed it.
+  volumes: Array(TRACK_COUNT).fill(1),
   micId: "",             // "" = system default input
   selected: 0,
   transport: "stopped",  // "stopped" | "running"
@@ -152,6 +157,7 @@ async function initAudio() {
       gain,
       source: null,
       muted: false,
+      muteAt: 0,        // boundary a pending mute lands on, see toggleMute
       layers: 0,
       env: null,        // cached waveform envelope
       envBuffer: null,  // buffer the envelope was computed from
@@ -1387,22 +1393,47 @@ function commitOverdub(ch, scratch, take) {
 }
 
 // ---------------------------------------------------------------------------
-// Mute / clear
+// Level / mute / clear
 // ---------------------------------------------------------------------------
+
+// The channel gain is the product of the two things the user controls: the mute
+// latch and the volume slider. Both write it through rampChannelGain, so the
+// two cannot disagree about what the gain should be.
+function channelTarget(ch) {
+  return ch.muted ? 0 : state.volumes[ch.index];
+}
+
+// `when` is the time the new level lands. A mute waits for the loop boundary so
+// the track drops in and out on the beat; the volume slider lands immediately,
+// because it is a mix move and a slider that waits a whole loop reads as broken.
+function rampChannelGain(ch, when) {
+  const now = ctx.currentTime;
+  const at = Math.max(when, now);
+  const g = ch.gain.gain;
+  // Hold the current value until `at`, then ramp. Reading .value here is
+  // correct because nothing else is scheduled on this param.
+  g.cancelScheduledValues(now);
+  g.setValueAtTime(g.value, now);
+  if (at > now) g.setValueAtTime(g.value, at);
+  g.linearRampToValueAtTime(channelTarget(ch), at + RAMP_SECONDS);
+}
 
 function toggleMute(ch) {
   ch.muted = !ch.muted;
-  const target = ch.muted ? 0 : 1;
   const now = ctx.currentTime;
-  const when = state.transport === "running" ? nextBoundaryTime(now) : now;
-  const g = ch.gain.gain;
-  // Hold the current value until the boundary, then ramp. Reading .value here
-  // is correct because nothing else is scheduled on this param.
-  g.cancelScheduledValues(now);
-  g.setValueAtTime(g.value, now);
-  g.setValueAtTime(g.value, when);
-  g.linearRampToValueAtTime(target, when + RAMP_SECONDS);
+  ch.muteAt = state.transport === "running" ? nextBoundaryTime(now) : now;
+  rampChannelGain(ch, ch.muteAt);
   render();
+}
+
+// A mute that is still waiting for its boundary must not be cancelled by a
+// volume move: both land on the same boundary, so the latch and the level agree.
+function setVolume(i, value) {
+  state.volumes[i] = value;
+  const ch = state.channels[i];
+  if (!ch || !ctx) return;
+  const now = ctx.currentTime;
+  rampChannelGain(ch, ch.muteAt > now ? ch.muteAt : now);
 }
 
 function clearChannel(ch) {
@@ -1414,11 +1445,12 @@ function clearChannel(ch) {
   ch.layers = 0;
   ch.state = "empty";
   ch.muted = false;
+  ch.muteAt = 0;
   ch.envBuffer = null;
   ch.env = null;
   const g = ch.gain.gain;
   g.cancelScheduledValues(ctx.currentTime);
-  g.setValueAtTime(1, ctx.currentTime);
+  g.setValueAtTime(channelTarget(ch), ctx.currentTime);
 
   // loopLength is what marks "a loop exists" in both modes, so it has to follow
   // the buffers. In Free Mode the surviving tracks define the length; in Tempo
@@ -1515,8 +1547,13 @@ async function exportMix() {
   for (const ch of active) {
     const src = offline.createBufferSource();
     src.buffer = ch.buffer;
-    src.connect(dry);
-    src.connect(conv);
+    // The per-track level is part of the mix, so the render has to apply it: an
+    // export that ignored the sliders would not be what the user hears.
+    const level = offline.createGain();
+    level.gain.value = state.volumes[ch.index];
+    src.connect(level);
+    level.connect(dry);
+    level.connect(conv);
     src.start(0);
   }
 
@@ -1793,6 +1830,7 @@ function buildTracks() {
     const tile = document.createElement("div");
     tile.className = "track nb-card";
     tile.dataset.index = i;
+    const vol = Math.round(state.volumes[i] * 100);
     tile.innerHTML = `
       <div class="track-head">
         <span class="track-name">Track ${i + 1}</span>
@@ -1800,6 +1838,11 @@ function buildTracks() {
       </div>
       <canvas class="wave" data-wave="${i}"></canvas>
       <button type="button" class="primary nb-button" data-primary="${i}">RECORD</button>
+      <div class="track-vol">
+        <label class="track-vol-label" for="vol-${i}">Vol</label>
+        <input type="range" id="vol-${i}" data-vol="${i}" min="0" max="100" step="1" value="${vol}">
+        <output data-volout="${i}">${vol}</output>
+      </div>
       <div class="track-foot">
         <button type="button" class="small nb-button" data-mute="${i}">MUTE</button>
         <button type="button" class="small nb-button" data-clear="${i}">CLEAR</button>
@@ -1812,6 +1855,15 @@ function buildTracks() {
     if (t.dataset.primary !== undefined) onPrimary(Number(t.dataset.primary));
     else if (t.dataset.mute !== undefined) onMute(Number(t.dataset.mute));
     else if (t.dataset.clear !== undefined) onClear(Number(t.dataset.clear));
+  });
+
+  el.tracks.addEventListener("input", (e) => {
+    const t = e.target;
+    if (t.dataset.vol === undefined) return;
+    const i = Number(t.dataset.vol);
+    const out = el.tracks.children[i].querySelector("[data-volout]");
+    if (out) out.textContent = t.value;
+    setVolume(i, Number(t.value) / 100);
   });
 
   bindClearHold();

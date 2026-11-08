@@ -499,6 +499,44 @@ input.nb-checkbox:checked::before {
   color: #fff;
 }
 
+/* Per-track level. The slider is the same control as Master, so it keeps the
+   global range styling; this row only lays out the label and the readout, and
+   tints the thumb with the track hue so the four sliders read as four tracks.
+   The readout has a fixed width so the slider does not resize as the number
+   goes from 100 to 40 to 0. */
+.track-vol {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.track-vol-label {
+  font-family: var(--nb-font);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.track-vol input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.track-vol input[type="range"]::-webkit-slider-thumb { background: var(--track); }
+.track-vol input[type="range"]::-moz-range-thumb { background: var(--track); }
+
+.track-vol output {
+  min-width: 26px;
+  text-align: right;
+  font-family: var(--nb-font);
+  font-size: 10px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  color: var(--track);
+}
+
 /* --------------------------------------------------------------------------
    Export
    -------------------------------------------------------------------------- */
