@@ -80,10 +80,10 @@ and re-enters it at the wrong offset. `scheduleChannel` clears `ch.source` in
 
 ## The sequencer is a gate, not a second clock
 
-A slot is one full loop, so the step is `floor((now − t0) / L) mod 4`. There is
-no second timer: the grid is read off the transport clock, which is the only
-clock the audio is scheduled on. A separate interval would drift against the
-loop, and the drift would be audible as a track entering a few milliseconds
+A slot is one full loop, so the step is `floor((now − t0) / L) mod state.seqSteps`.
+There is no second timer: the grid is read off the transport clock, which is the
+only clock the audio is scheduled on. A separate interval would drift against
+the loop, and the drift would be audible as a track entering a few milliseconds
 late on every pass.
 
 The gate is a `seqGain` node in front of the channel gain:
@@ -131,9 +131,9 @@ track playing on the wrong slot:
   the next boundary in the same pass, and `rampSeqGain()` cancels from the
   boundary rather than from `now`, so an immediate ramp survives.
 
-A pattern that does not loop ends at `t0 + 4L`. The gate has already ramped
-every track to silence at that boundary, so `stopTransport()` cannot cut a tail;
-it only releases the sources.
+A pattern that does not loop ends at `t0 + seqSteps·L`. The gate has already
+ramped every track to silence at that boundary, so `stopTransport()` cannot cut
+a tail; it only releases the sources.
 
 The row is a **view** of the track, not a copy of its samples. An overdub is
 heard through the row without copying again, and `clearChannel()` drops the row
@@ -342,15 +342,31 @@ Lock the grid is derived from BPM and bars, but the flag still has to follow the
 buffers or the next record press arms against a loop with nothing in it.
 
 `state.playMode` is the playback mode, not the recording mode: `"loop"` or
-`"sequence"`. `state.seqRows` is a sparse array indexed by track, holding
+`"sequence"`. `state.seqSteps` is the pattern length: 4, 8, 16 or 32 slots, one
+full loop each. `state.seqRows` is a sparse array indexed by track, holding
 `{ steps }` for a copied track and `null` for one that was never copied. It is
 indexed by track rather than kept as a list so the gate lookup is one array
 index, and so a row cannot outlive the track it belongs to.
+
+`state.trackCount` is the number of tracks. `state.channels`, `state.volumes`
+and `state.seqRows` are parallel arrays indexed by track position.
 
 `pendingRecord.definesLoop` is true only for the first Free Mode take, which
 defines the loop length instead of matching it. `isLockedTake()` is the single
 place that decides whether a take can be punched out; `render()` and `punchOut()`
 both use it so they cannot disagree.
+
+## Track indices are positions, not identities
+
+Adding a track appends to all three parallel arrays. Removing an empty track
+splices all three and rewrites `ch.index` for every channel after the gap. The
+gate, the level, the row and the stem name are all looked up by that index, so a
+removal that skips the rewrite makes the gate read the next track's row and the
+volume slider write the next track's level.
+
+A track that holds audio is never removed: the UI disables the control and
+`removeTrack()` refuses. The last remaining track is kept for the same reason the
+app always has at least one record target.
 
 ## The channel gain is mute times volume
 
@@ -427,4 +443,4 @@ node disconnect, so toggling never clicks.
 - **No punch-out of a fixed-length take.** A later Free Mode track and an overdub
   both run to the end of the loop.
 - **No pattern export.** The export renders one loop of the tracks, not the
-  four-loop arrangement. The pattern is a playback arrangement, not material.
+  multi-loop arrangement. The pattern is a playback arrangement, not material.

@@ -70,7 +70,14 @@ const EXPORTS = [
   "setPlayMode",
   "scheduleAhead",
   "stopTransport",
-  "SEQ_STEPS",
+  "setSeqSteps",
+  "addTrack",
+  "removeTrack",
+  "buildTracks",
+  "DEFAULT_TRACK_COUNT",
+  "MAX_TRACKS",
+  "DEFAULT_SEQ_STEPS",
+  "SEQ_STEP_OPTIONS",
 ];
 
 // Names are probed with typeof so the harness still loads against a version of
@@ -208,7 +215,6 @@ function makeElement(tag) {
       contains(c) { return this._set.has(c); },
     },
     textContent: "",
-    innerHTML: "",
     hidden: false,
     disabled: false,
     value: "",
@@ -227,6 +233,16 @@ function makeElement(tag) {
     getContext: () => makeCanvasContext(),
     click() {},
   };
+  // Replacing innerHTML clears the children, as it does in the browser. The
+  // track grid is rebuilt after a track is added or removed.
+  let html = "";
+  Object.defineProperty(el, "innerHTML", {
+    get() { return html; },
+    set(value) {
+      html = String(value);
+      el.children.length = 0;
+    },
+  });
   return el;
 }
 

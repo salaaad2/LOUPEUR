@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Loupeur</title>
 <link rel="stylesheet" href="index.min.css">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=20261109">
 </head>
 <body>
 
@@ -72,15 +72,31 @@
     </div>
   </section>
 
-  <section class="tracks" id="tracks"></section>
+  <section class="tracks-section">
+    <div class="tracks" id="tracks"></div>
+    <div class="tracks-actions">
+      <button type="button" id="addTrack" class="nb-button add-track">+ Add track</button>
+    </div>
+  </section>
 
   <section class="panel sequencer nb-card" id="sequencer">
     <div class="seq-head">
       <h2 class="seq-title">Sequencer</h2>
-      <label class="seq-loop" for="seqLoop">
-        <input type="checkbox" id="seqLoop" class="nb-checkbox" checked>
-        Loop pattern
-      </label>
+      <div class="seq-head-right">
+        <label class="seq-length" for="seqLength">
+          Slots
+          <select id="seqLength" class="nb-dropdown">
+            <option value="4" selected>4</option>
+            <option value="8">8</option>
+            <option value="16">16</option>
+            <option value="32">32</option>
+          </select>
+        </label>
+        <label class="seq-loop" for="seqLoop">
+          <input type="checkbox" id="seqLoop" class="nb-checkbox" checked>
+          Loop pattern
+        </label>
+      </div>
     </div>
     <div class="seq-rows" id="seqRows"></div>
     <p class="nb-help" id="seqHelp">Copy a track to the sequencer, then fill the slots.</p>
@@ -106,13 +122,13 @@
     <p id="modeHelp">Tempo Lock: 4 bars at 100 BPM. Recording snaps to the grid.</p>
     <p class="keys">
       <kbd>R</kbd> record / punch out (LOOP) &nbsp;·&nbsp;
-      <kbd>1</kbd>–<kbd>4</kbd> select track &nbsp;·&nbsp;
+      <kbd>1</kbd>–<kbd>8</kbd> select track &nbsp;·&nbsp;
       <kbd>Space</kbd> stop / resume
     </p>
   </section>
 
 </main>
 
-<script src="app.js"></script>
+<script src="app.js?v=20261109"></script>
 </body>
 </html>

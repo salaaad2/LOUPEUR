@@ -384,4 +384,92 @@ tests.push({
   },
 });
 
+tests.push({
+  name: "sequencer: the pattern length changes the step clock",
+  async fn() {
+    const t = load({ sampleRate: RATE });
+    await boot(t);
+    setup(t);
+    assert.strictEqual(t.state.seqSteps, t.DEFAULT_SEQ_STEPS);
+
+    t.setSeqSteps(8);
+    assert.strictEqual(t.seqStepIndex(7), 7);
+    assert.strictEqual(t.seqStepIndex(8), 0);
+
+    t.setSeqSteps(16);
+    assert.strictEqual(t.seqStepIndex(15), 15);
+    assert.strictEqual(t.seqStepIndex(16), 0);
+
+    t.setSeqSteps(32);
+    assert.strictEqual(t.seqStepIndex(31), 31);
+    assert.strictEqual(t.seqStepIndex(32), 0);
+  },
+});
+
+tests.push({
+  name: "sequencer: changing the pattern length pads and truncates rows",
+  async fn() {
+    const t = load({ sampleRate: RATE });
+    await boot(t);
+    setup(t);
+    t.toggleSeqRow(0);
+    t.toggleSeqStep(0, 0);
+    t.toggleSeqStep(0, 3);
+
+    t.setSeqSteps(8);
+    assert.deepStrictEqual(
+      Array.from(t.state.seqRows[0].steps),
+      [true, false, false, true, false, false, false, false]
+    );
+
+    t.setSeqSteps(4);
+    assert.deepStrictEqual(Array.from(t.state.seqRows[0].steps), [true, false, false, true]);
+
+    // Shrinking is permanent: growing again pads with empty slots.
+    t.setSeqSteps(8);
+    assert.deepStrictEqual(
+      Array.from(t.state.seqRows[0].steps),
+      [true, false, false, true, false, false, false, false]
+    );
+  },
+});
+
+tests.push({
+  name: "sequencer: a row is created at the current pattern length",
+  async fn() {
+    const t = load({ sampleRate: RATE });
+    await boot(t);
+    setup(t);
+    t.setSeqSteps(16);
+    t.toggleSeqRow(0);
+    assert.strictEqual(t.state.seqRows[0].steps.length, 16);
+  },
+});
+
+tests.push({
+  name: "sequencer: a non-looping pattern ends at the configured last slot",
+  async fn() {
+    const t = load({ sampleRate: RATE });
+    await boot(t);
+    const ch = setup(t);
+    t.state.playMode = "sequence";
+    t.state.seqLoop = false;
+    t.setSeqSteps(8);
+    t.toggleSeqRow(0);
+    for (let s = 0; s < 8; s++) t.toggleSeqStep(0, s);
+    t.startTransport(0);
+
+    assert.strictEqual(t.channelAudible(ch, 7.5), true);
+    assert.strictEqual(t.channelAudible(ch, 8), false);
+
+    t.__ctx.__clock.now = 7.5;
+    t.scheduleAhead();
+    assert.strictEqual(t.state.transport, "running", "stopped before the last slot ended");
+
+    t.__ctx.__clock.now = 8;
+    t.scheduleAhead();
+    assert.strictEqual(t.state.transport, "stopped");
+  },
+});
+
 module.exports = tests;

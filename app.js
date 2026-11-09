@@ -4,8 +4,10 @@
 // Constants
 // ---------------------------------------------------------------------------
 
-const TRACK_COUNT = 4;
-const SEQ_STEPS = 4;             // slots per sequencer row, one full loop each
+const DEFAULT_TRACK_COUNT = 4;
+const MAX_TRACKS = 8;
+const DEFAULT_SEQ_STEPS = 4;
+const SEQ_STEP_OPTIONS = [4, 8, 16, 32];  // slots per sequencer row, one full loop each
 
 // Transport
 const LOOKAHEAD_MS = 25;         // scheduler tick
@@ -61,12 +63,16 @@ const state = {
   // has filled, and a track with no row is silent.
   playMode: "loop",      // "loop" | "sequence"
   seqLoop: true,         // pattern repeats; false stops the transport after the last slot
-  seqRows: new Array(TRACK_COUNT).fill(null),  // one row per copied track, by track index
+  seqSteps: DEFAULT_SEQ_STEPS,  // slots per sequencer row, one full loop each
+  seqRows: new Array(DEFAULT_TRACK_COUNT).fill(null),  // one row per copied track, by track index
+  // Number of track tiles. The audio channels are created later, in initAudio();
+  // this is the count the UI and the parallel volumes/seqRows arrays follow.
+  trackCount: DEFAULT_TRACK_COUNT,
   // Per-track level, 0..1, indexed by track. It lives here rather than on the
   // channel because the slider has to work before the audio graph exists: the
   // channels are created in initAudio(), and a level set before the first
   // record would otherwise be lost while the slider still showed it.
-  volumes: Array(TRACK_COUNT).fill(1),
+  volumes: Array(DEFAULT_TRACK_COUNT).fill(1),
   micId: "",             // "" = system default input
   selected: 0,
   transport: "stopped",  // "stopped" | "running"
@@ -122,7 +128,9 @@ const el = {
   playMode: document.getElementById("playMode"),
   seqRows: document.getElementById("seqRows"),
   seqLoop: document.getElementById("seqLoop"),
+  seqLength: document.getElementById("seqLength"),
   seqHelp: document.getElementById("seqHelp"),
+  addTrack: document.getElementById("addTrack"),
 };
 
 // ---------------------------------------------------------------------------
@@ -158,33 +166,39 @@ async function initAudio() {
   wetGain.connect(masterGain);
   masterGain.connect(ctx.destination);
 
-  for (let i = 0; i < TRACK_COUNT; i++) {
-    const gain = ctx.createGain();
-    gain.gain.value = 1;
-    gain.connect(dryGain);
-    gain.connect(convolver);
-    // The sequencer gate sits in front of the channel gain, so mute and volume
-    // stay exactly what they were: the gate is a third, independent factor and
-    // the two existing ones are not rewritten to carry it.
-    const seqGain = ctx.createGain();
-    seqGain.gain.value = 1;
-    seqGain.connect(gain);
-    state.channels.push({
-      index: i,
-      state: "empty",
-      buffer: null,
-      gain,
-      seqGain,
-      source: null,
-      muted: false,
-      muteAt: 0,        // boundary a pending mute lands on, see toggleMute
-      layers: 0,
-      env: null,        // cached waveform envelope
-      envBuffer: null,  // buffer the envelope was computed from
-    });
+  for (let i = 0; i < state.trackCount; i++) {
+    createChannel(i);
   }
 
   if (ctx.state === "suspended") await ctx.resume();
+}
+
+// Builds one channel and wires it into the graph. Called for every track when
+// the audio graph is created, and again when a track is added after that.
+function createChannel(i) {
+  const gain = ctx.createGain();
+  gain.gain.value = 1;
+  gain.connect(dryGain);
+  gain.connect(convolver);
+  // The sequencer gate sits in front of the channel gain, so mute and volume
+  // stay exactly what they were: the gate is a third, independent factor and
+  // the two existing ones are not rewritten to carry it.
+  const seqGain = ctx.createGain();
+  seqGain.gain.value = 1;
+  seqGain.connect(gain);
+  state.channels.push({
+    index: i,
+    state: "empty",
+    buffer: null,
+    gain,
+    seqGain,
+    source: null,
+    muted: false,
+    muteAt: 0,        // boundary a pending mute lands on, see toggleMute
+    layers: 0,
+    env: null,        // cached waveform envelope
+    envBuffer: null,  // buffer the envelope was computed from
+  });
 }
 
 function makeImpulse(seconds, decay) {
@@ -965,7 +979,7 @@ function scheduleAhead() {
   // slot. The gate has already ramped every track to silence there, so the
   // stop cannot cut a tail; it only releases the sources.
   if (!state.seqLoop && state.playMode === "sequence") {
-    if (ctx.currentTime >= state.t0 + SEQ_STEPS * Lsec) {
+    if (ctx.currentTime >= state.t0 + state.seqSteps * Lsec) {
       stopTransport();
       render();
       return;
@@ -1122,7 +1136,7 @@ function scheduleChannel(ch, when, offsetSamples) {
 
 // The step the transport is on at `when`, counted in whole loops from t0. Not
 // wrapped: the caller wraps it for the pattern and compares it against
-// SEQ_STEPS to find the end of a pattern that does not loop.
+// state.seqSteps to find the end of a pattern that does not loop.
 function seqStepAt(when) {
   if (!ctx) return 0;
   const L = loopSamples() / ctx.sampleRate;
@@ -1134,11 +1148,11 @@ function seqStepAt(when) {
   return Math.floor((when - state.t0) / L + 1e-9);
 }
 
-// The slot a time falls in, 0..SEQ_STEPS-1. Clamped at zero so a time before
-// t0 (a transport that has not started yet) reads as the first slot instead of
-// wrapping to the last one.
+// The slot a time falls in, 0..state.seqSteps-1. Clamped at zero so a time
+// before t0 (a transport that has not started yet) reads as the first slot
+// instead of wrapping to the last one.
 function seqStepIndex(when) {
-  return Math.max(0, seqStepAt(when)) % SEQ_STEPS;
+  return Math.max(0, seqStepAt(when)) % state.seqSteps;
 }
 
 // True when a channel should be heard at `when`.
@@ -1156,7 +1170,7 @@ function channelAudible(ch, when) {
   const row = state.seqRows[ch.index];
   if (!row) return false;
   const n = seqStepAt(when);
-  if (!state.seqLoop && n >= SEQ_STEPS) return false;
+  if (!state.seqLoop && n >= state.seqSteps) return false;
   return row.steps[seqStepIndex(when)];
 }
 
@@ -1210,7 +1224,24 @@ function toggleSeqRow(i) {
   if (!ch || !ch.buffer) return;
   state.seqRows[i] = state.seqRows[i]
     ? null
-    : { steps: new Array(SEQ_STEPS).fill(false) };
+    : { steps: new Array(state.seqSteps).fill(false) };
+  refreshSeqGates();
+  render();
+}
+
+// Changes the pattern length. Growing pads every row with empty slots; shrinking
+// truncates them permanently, which is the behaviour the control promises.
+function setSeqSteps(n) {
+  if (!SEQ_STEP_OPTIONS.includes(n) || n === state.seqSteps) return;
+  state.seqSteps = n;
+  for (const row of state.seqRows) {
+    if (!row) continue;
+    const next = new Array(n).fill(false);
+    for (let s = 0; s < Math.min(n, row.steps.length); s++) next[s] = row.steps[s];
+    row.steps = next;
+  }
+  // The gate of the slot that is playing may have moved, and a non-looping
+  // pattern may now end sooner. Re-apply now; scheduleAhead picks up the rest.
   refreshSeqGates();
   render();
 }
@@ -1221,7 +1252,7 @@ function toggleSeqRow(i) {
 // picked up by the boundary scheduler when its turn comes.
 function toggleSeqStep(i, step) {
   const row = state.seqRows[i];
-  if (!row || step < 0 || step >= SEQ_STEPS) return;
+  if (!row || step < 0 || step >= state.seqSteps) return;
   row.steps[step] = !row.steps[step];
   refreshSeqGates();
   render();
@@ -1905,7 +1936,10 @@ const WAVE_COLORS = {
 };
 
 // Must stay in step with the --track hues in style.css.
-const TRACK_COLORS = ["#83e28b", "#98bfe7", "#e6acec", "#c0f1ed"];
+const TRACK_COLORS = [
+  "#83e28b", "#98bfe7", "#e6acec", "#c0f1ed",
+  "#f6d365", "#c9a7f5", "#f4a6a6", "#a9e5d8",
+];
 
 function trackColor(ch) {
   return TRACK_COLORS[ch.index % TRACK_COLORS.length];
@@ -2060,7 +2094,7 @@ function startWaveLoop() {
     waveRaf = requestAnimationFrame(tick);
     if (!ctx) return;
     let armed = false;
-    for (let i = 0; i < TRACK_COUNT; i++) {
+    for (let i = 0; i < state.trackCount; i++) {
       const ch = state.channels[i];
       const tile = el.tracks.children[i];
       if (!ch || !tile) continue;
@@ -2080,13 +2114,12 @@ function startWaveLoop() {
 // UI
 // ---------------------------------------------------------------------------
 
-function buildTracks() {
-  for (let i = 0; i < TRACK_COUNT; i++) {
-    const tile = document.createElement("div");
-    tile.className = "track nb-card";
-    tile.dataset.index = i;
-    const vol = Math.round(state.volumes[i] * 100);
-    tile.innerHTML = `
+function createTrackTile(i) {
+  const tile = document.createElement("div");
+  tile.className = "track nb-card";
+  tile.dataset.index = i;
+  const vol = Math.round(state.volumes[i] * 100);
+  tile.innerHTML = `
       <div class="track-head">
         <span class="track-name">Track ${i + 1}</span>
         <span class="layers" data-layers="${i}">0</span>
@@ -2101,16 +2134,38 @@ function buildTracks() {
       <div class="track-foot">
         <button type="button" class="small nb-button" data-mute="${i}">MUTE</button>
         <button type="button" class="small nb-button" data-clear="${i}">CLEAR</button>
+        <button type="button" class="small nb-button" data-remove="${i}">REMOVE</button>
       </div>
       <button type="button" class="small nb-button seq-copy" data-seq="${i}">COPY TO SEQ</button>`;
-    el.tracks.appendChild(tile);
+  return tile;
+}
+
+function buildTracks() {
+  rebuildTracks();
+  bindTrackEvents();
+}
+
+// Rebuilds the tiles after the track count changes. The event listeners live on
+// the container, so replacing the children does not lose them.
+function rebuildTracks() {
+  el.tracks.innerHTML = "";
+  for (let i = 0; i < state.trackCount; i++) {
+    el.tracks.appendChild(createTrackTile(i));
   }
+}
+
+let tracksBound = false;
+
+function bindTrackEvents() {
+  if (tracksBound) return;
+  tracksBound = true;
 
   el.tracks.addEventListener("click", (e) => {
     const t = e.target;
     if (t.dataset.primary !== undefined) onPrimary(Number(t.dataset.primary));
     else if (t.dataset.mute !== undefined) onMute(Number(t.dataset.mute));
     else if (t.dataset.clear !== undefined) onClear(Number(t.dataset.clear));
+    else if (t.dataset.remove !== undefined) removeTrack(Number(t.dataset.remove));
     else if (t.dataset.seq !== undefined) toggleSeqRow(Number(t.dataset.seq));
   });
 
@@ -2155,6 +2210,55 @@ function bindClearHold() {
   el.tracks.addEventListener("pointercancel", cancel);
 }
 
+// Appends an empty track. The audio channel is created only if the graph
+// already exists; otherwise initAudio() creates every channel on the first
+// record press.
+function addTrack() {
+  if (state.trackCount >= MAX_TRACKS) return;
+  const i = state.trackCount;
+  state.trackCount++;
+  state.volumes.push(1);
+  state.seqRows.push(null);
+  if (ctx) createChannel(i);
+  state.selected = i;
+  rebuildTracks();
+  render();
+}
+
+// Removes a track that holds no audio. The three parallel arrays are spliced
+// together and every channel after the gap gets its index rewritten, because a
+// row, a volume and a stem name are all looked up by that index.
+function removeTrack(i) {
+  if (i < 0 || i >= state.trackCount) return;
+  if (state.trackCount <= 1) {
+    showBanner("Keep at least one track.");
+    return;
+  }
+  const ch = state.channels[i];
+  if (ch && (ch.buffer || ch.state !== "empty")) {
+    showBanner("Clear the track before removing it.");
+    return;
+  }
+  if (ch) {
+    if (ch.source) {
+      try { ch.source.stop(); } catch (_) {}
+      ch.source = null;
+    }
+    ch.gain.disconnect();
+    ch.seqGain.disconnect();
+    state.channels.splice(i, 1);
+    for (let j = i; j < state.channels.length; j++) state.channels[j].index = j;
+  }
+  state.volumes.splice(i, 1);
+  state.seqRows.splice(i, 1);
+  state.trackCount--;
+  if (state.selected > i) state.selected--;
+  else if (state.selected === i) state.selected = Math.min(i, state.trackCount - 1);
+  refreshSeqGates();
+  rebuildTracks();
+  render();
+}
+
 async function onPrimary(i) {
   await initAudio();
   // The button is disabled in SEQUENCE mode, but the R shortcut reaches this
@@ -2192,7 +2296,7 @@ function onClear(i) {
 // per-frame render does not throw away the buttons under the pointer.
 function buildSeqRows() {
   const html = [];
-  for (let i = 0; i < TRACK_COUNT; i++) {
+  for (let i = 0; i < state.trackCount; i++) {
     const row = state.seqRows[i];
     if (!row) continue;
     const steps = row.steps
@@ -2212,20 +2316,24 @@ function buildSeqRows() {
 }
 
 let seqSignature = "";
+let seqPlayhead = -1;
 
 function renderSequencer() {
-  const sig = state.seqRows.map((r) => (r ? "1" : "0")).join("");
+  const sig = state.seqSteps + ":" + state.seqRows.map((r) => (r ? "1" : "0")).join("");
   if (sig !== seqSignature) {
     seqSignature = sig;
     buildSeqRows();
+    // The rows were replaced, so the old .now marker is gone. Force the next
+    // playhead tick to mark the current slot even if its number did not change.
+    seqPlayhead = -1;
   }
-  for (let i = 0; i < TRACK_COUNT; i++) {
+  for (let i = 0; i < state.trackCount; i++) {
     const row = state.seqRows[i];
     if (!row) continue;
     const rowEl = el.seqRows.querySelector(`[data-row="${i}"]`);
     if (!rowEl) continue;
     const steps = rowEl.querySelectorAll(".seq-step");
-    for (let s = 0; s < SEQ_STEPS; s++) {
+    for (let s = 0; s < state.seqSteps; s++) {
       const btn = steps[s];
       if (!btn) continue;
       btn.classList.toggle("on", row.steps[s]);
@@ -2242,13 +2350,14 @@ function seqHelpText() {
   if (state.playMode === "loop") {
     return "Inactive in LOOP mode. Switch the header to SEQUENCE to hear the grid.";
   }
-  return "Click a slot to fill it. Each slot is one full loop.";
+  const bars = state.mode === "tempo"
+    ? ` (${state.bars} bar${state.bars > 1 ? "s" : ""} each)`
+    : "";
+  return `Click a slot to fill it. ${state.seqSteps} slots, each one full loop${bars}.`;
 }
 
 // The slot the transport is on, marked on every row. Only the change is
 // written, so a per-frame call costs nothing while the slot holds.
-let seqPlayhead = -1;
-
 function updateSeqPlayhead() {
   if (!ctx || state.playMode !== "sequence" || state.transport !== "running") {
     if (seqPlayhead !== -1) {
@@ -2264,7 +2373,7 @@ function updateSeqPlayhead() {
 }
 
 function markSeqPlayhead(step) {
-  for (let i = 0; i < TRACK_COUNT; i++) {
+  for (let i = 0; i < state.trackCount; i++) {
     if (!state.seqRows[i]) continue;
     const rowEl = el.seqRows.querySelector(`[data-row="${i}"]`);
     if (!rowEl) continue;
@@ -2276,12 +2385,22 @@ function markSeqPlayhead(step) {
 }
 
 function render() {
-  for (let i = 0; i < TRACK_COUNT; i++) {
+  for (let i = 0; i < state.trackCount; i++) {
     const ch = state.channels[i];
     const tile = el.tracks.children[i];
-    if (!tile || !ch) continue;
+    if (!tile) continue;
 
     tile.classList.toggle("selected", state.selected === i);
+
+    const removeBtn = tile.querySelector("[data-remove]");
+    if (removeBtn) {
+      removeBtn.disabled =
+        state.trackCount <= 1 || Boolean(ch && (ch.buffer || ch.state !== "empty"));
+    }
+
+    // Before the first record press the channels do not exist yet. The tile is
+    // still there, so leave its controls at their initial values.
+    if (!ch) continue;
 
     const primary = tile.querySelector("[data-primary]");
     // A take that runs a fixed length cannot be punched out: a later Free Mode
@@ -2335,6 +2454,8 @@ function render() {
   // The stems checkbox is an action, not a mode: it is only live while there is
   // something to write and no export is already running.
   el.stems.disabled = exportingStems || !hasAudio;
+  if (el.addTrack) el.addTrack.disabled = state.trackCount >= MAX_TRACKS;
+  if (el.seqLength) el.seqLength.value = String(state.seqSteps);
 
   // The offset readout shows the number actually in force for the open device:
   // the measured one once calibration has run, the estimate before that. It is
@@ -2405,6 +2526,14 @@ function bindControls() {
     state.seqLoop = el.seqLoop.checked;
     render();
   });
+
+  if (el.seqLength) {
+    el.seqLength.addEventListener("change", () => {
+      setSeqSteps(Number(el.seqLength.value));
+    });
+  }
+
+  if (el.addTrack) el.addTrack.addEventListener("click", addTrack);
 
   el.seqRows.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-seqrow]");
@@ -2490,9 +2619,12 @@ function bindControls() {
     const t = e.target;
     if (t && t.matches && t.matches("input, select, textarea")) return;
 
-    if (e.key >= "1" && e.key <= "4") {
-      state.selected = Number(e.key) - 1;
-      render();
+    if (e.key >= "1" && e.key <= "9") {
+      const i = Number(e.key) - 1;
+      if (i < state.trackCount) {
+        state.selected = i;
+        render();
+      }
     } else if (e.key === "r" || e.key === "R") {
       onPrimary(state.selected);
     } else if (e.code === "Space") {

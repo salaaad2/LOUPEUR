@@ -1,10 +1,10 @@
-# Loupeur — 4-track browser looper
+# Loupeur — browser looper
 
-A looper pedal in the browser (Boss RC-505 mental model). Record up to four
+A looper pedal in the browser (Boss RC-505 mental model). Record up to eight
 synced loop tracks from a microphone, overdub layers, mute and clear them, and
 export the mix as a WAV. Copy a track to the sequencer to arrange it over a
-four-loop pattern. Everything runs client-side; audio never leaves the machine.
-No build step, no dependencies, no backend.
+4/8/16/32-loop pattern. Everything runs client-side; audio never leaves the
+machine. No build step, no dependencies, no backend.
 
 ```
 index.html            static markup
@@ -37,12 +37,15 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | `MUTE` | Per-track mute, ramped at the next loop boundary |
 | `CLEAR` | Long-press (~600 ms) wipes the track |
 | Track volume | Per-track level, applied to playback and to the export |
+| Add track | Appends an empty track, up to eight |
+| `REMOVE` | Drops a track that holds no audio; disabled once it has a take |
 | BPM / Bars | Tempo Lock grid: 60–180 BPM, 1/2/4/8 bars |
 | Mode | Free (first take sets the length) or Tempo Lock (grid + count-in) |
 | Playback mode (header) | `LOOP` plays every track every loop; `SEQUENCE` plays only the slots the grid has filled |
 | `COPY TO SEQ` | Adds the track to the sequencer as a row; press again to remove it |
 | Sequencer slot | One full loop. Click to fill (`X`) or empty it |
-| Loop pattern | On: the four slots repeat. Off: the pattern plays once and stops the transport |
+| Sequencer slots | 4/8/16/32 slots per pattern; each slot is one full loop |
+| Loop pattern | On: the pattern repeats. Off: the pattern plays once and stops the transport |
 | Click track | Count-in and metronome, Tempo Lock only. Never recorded or exported |
 | Click while recording | Keeps the metronome ticking under a take, so you can play to the grid |
 | Microphone | Input picker; `Default input` follows the system default |
@@ -50,7 +53,7 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | Export Mix | Renders the unmuted tracks to a 16-bit stereo WAV |
 | Export tracks separately | One `track{n}.wav` per track that holds audio, into a folder you pick, or as downloads where the folder picker is unavailable |
 
-Keyboard: `R` record/punch on the selected track (LOOP mode only), `1`–`4`
+Keyboard: `R` record/punch on the selected track (LOOP mode only), `1`–`8`
 select a track, `Space` stop/resume.
 
 ### The two recording modes
@@ -75,10 +78,11 @@ sequencer grid is inert. You can still fill it; you just cannot hear it.
 its tile is dimmed. A track with a row is heard on the slots that row has
 filled, and silent on the rest.
 
-A slot is one full loop, so a four-slot pattern is four loops long. The step
-clock is the transport clock divided by the loop length, which means the grid
-cannot drift against the audio. Filling the slot that is playing is heard
-immediately; a slot that is still ahead is picked up when its boundary arrives.
+A slot is one full loop, so the pattern is 4, 8, 16 or 32 loops long, chosen by
+the **Slots** control in the sequencer header. The step clock is the transport
+clock divided by the loop length, which means the grid cannot drift against the
+audio. Filling the slot that is playing is heard immediately; a slot that is
+still ahead is picked up when its boundary arrives.
 
 `COPY TO SEQ` is a copy, not a move: the track keeps its audio, its level and
 its mute, and the row is a view of it. An overdub is heard through the row
@@ -140,16 +144,22 @@ audio, numbered by track so an empty track leaves a gap, a muted track still
 gets a file, and the download fallback used where the folder picker is missing.
 
 The sequencer tests cover the step clock and the gate: a slot is one full loop,
-a time before the transport starts reads as the first slot, LOOP mode plays
-every track, SEQUENCE mode silences a track with no row, the gate follows the
-filled slots and repeats, the gate ramps on the boundary rather than mid-loop,
-a pattern that does not loop stops the transport after its last slot, copying
-and clearing a track add and drop its row, the mode switch waits for a live
-take, and the gate is a separate node so mute and volume keep their meaning.
-Three of them pin the timing hazards that made a track play on the wrong slot:
-a boundary that floors to the previous slot, a gate refresh that drops the
-boundary ramp the scheduler had queued, and a boundary the scheduler reached
-late.
+the pattern length can be 4/8/16/32 and rows are padded or truncated when it
+changes, a time before the transport starts reads as the first slot, LOOP mode
+plays every track, SEQUENCE mode silences a track with no row, the gate follows
+the filled slots and repeats, the gate ramps on the boundary rather than
+mid-loop, a pattern that does not loop stops the transport after its last slot,
+copying and clearing a track add and drop its row, the mode switch waits for a
+live take, and the gate is a separate node so mute and volume keep their
+meaning. Three of them pin the timing hazards that made a track play on the
+wrong slot: a boundary that floors to the previous slot, a gate refresh that
+drops the boundary ramp the scheduler had queued, and a boundary the scheduler
+reached late.
+
+The track tests cover the parallel arrays: adding grows the channels, volumes
+and rows; the add control stops at eight; removing an empty track splices all
+three and rewrites the channel indices; and a track with audio or the last
+remaining track cannot be removed.
 
 They assert internal consistency, not an absolute offset, which is why they hold
 on any device. Anything involving real capture, scheduling or rendering still
@@ -169,7 +179,7 @@ needs a browser and a microphone.
   readout next to the Latency label always shows the number in force.
 - Export renders one loop plus a 1 s reverb tail, trimmed to the loop length.
 - **The export ignores the sequencer pattern.** `Export Mix` and the stems
-  render one loop of the tracks, not the four-loop arrangement: a track that
+  render one loop of the tracks, not the multi-loop arrangement: a track that
   plays on slots 1 and 3 appears once in the file. The pattern is a playback
   arrangement, not part of the material yet.
 - **Export tracks separately prefers a folder, and falls back to downloads.**

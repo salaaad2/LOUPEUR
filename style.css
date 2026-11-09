@@ -353,10 +353,26 @@ input.nb-checkbox:checked::before {
    Tracks
    -------------------------------------------------------------------------- */
 
+.tracks-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .tracks {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 18px;
+}
+
+.tracks-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.add-track {
+  padding: 8px 16px;
+  font-size: 10px;
 }
 
 .track {
@@ -373,13 +389,17 @@ input.nb-checkbox:checked::before {
 }
 
 /* Each track owns a hue. It tints the tile's top bar, name and small buttons
-   so the four tracks are distinguishable at a glance. The transport states
+   so the tracks are distinguishable at a glance. The transport states
    (armed / recording / playing / overdubbing) override it on the big button
    and the waveform, so a live state always reads louder than the track hue. */
 .track[data-index="0"], .seq-row[data-index="0"] { --track: #83e28b; }
 .track[data-index="1"], .seq-row[data-index="1"] { --track: #98bfe7; }
 .track[data-index="2"], .seq-row[data-index="2"] { --track: #e6acec; }
 .track[data-index="3"], .seq-row[data-index="3"] { --track: #c0f1ed; }
+.track[data-index="4"], .seq-row[data-index="4"] { --track: #f6d365; }
+.track[data-index="5"], .seq-row[data-index="5"] { --track: #c9a7f5; }
+.track[data-index="6"], .seq-row[data-index="6"] { --track: #f4a6a6; }
+.track[data-index="7"], .seq-row[data-index="7"] { --track: #a9e5d8; }
 
 .track::before {
   content: "";
@@ -513,6 +533,23 @@ input.nb-checkbox:checked::before {
   color: #fff;
 }
 
+/* A remove button is only live on an empty track. Keep the disabled state
+   visibly inert instead of letting the hover rule light it up. */
+.small:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.small:disabled:hover,
+.small:disabled:focus {
+  background: var(--panel-2);
+  color: var(--track);
+  box-shadow: none;
+  transform: none;
+}
+
 /* The copy button is a full-width row of its own, not a third button in the
    foot: "COPY TO SEQ" does not fit in a third of a tile. */
 .seq-copy {
@@ -531,7 +568,7 @@ input.nb-checkbox:checked::before {
 
 /* Per-track level. The slider is the same control as Master, so it keeps the
    global range styling; this row only lays out the label and the readout, and
-   tints the thumb with the track hue so the four sliders read as four tracks.
+   tints the thumb with the track hue so the sliders read as separate tracks.
    The readout has a fixed width so the slider does not resize as the number
    goes from 100 to 40 to 0. */
 .track-vol {
@@ -584,6 +621,29 @@ input.nb-checkbox:checked::before {
   gap: 16px;
 }
 
+.seq-head-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.seq-length {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--nb-font);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--dim);
+}
+
+.seq-length .nb-dropdown {
+  padding: 6px 10px;
+  font-size: 11px;
+}
+
 .seq-title {
   margin: 0;
   font-family: var(--nb-font);
@@ -634,6 +694,9 @@ input.nb-checkbox:checked::before {
 
 .seq-steps {
   display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  min-width: 0;
   gap: 8px;
 }
 
@@ -761,6 +824,8 @@ kbd {
   .tracks { grid-template-columns: 1fr; }
   .wrap { padding: 16px; }
   .header { margin: 16px 16px 0; padding: 14px 16px; flex-wrap: wrap; }
+  .seq-head { flex-wrap: wrap; }
+  .seq-head-right { flex-wrap: wrap; gap: 10px; }
   /* Four 46px slots plus the row name overflow a 320px screen. */
   .seq-step { width: 38px; height: 34px; }
   .seq-name { min-width: 64px; }
