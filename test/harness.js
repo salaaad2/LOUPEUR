@@ -60,6 +60,10 @@ const EXPORTS = [
   "clearChannel",
   "stemFiles",
   "exportStems",
+  "exportSequence",
+  "sequenceExportTracks",
+  "scheduleSeqGate",
+  "RAMP_SECONDS",
   "channelAudible",
   "seqStepAt",
   "seqStepIndex",
@@ -206,6 +210,7 @@ function makeElement(tag) {
     tagName: String(tag).toUpperCase(),
     children: [],
     dataset: {},
+    attributes: {},
     style: {},
     classList: {
       _set: new Set(),
@@ -213,6 +218,12 @@ function makeElement(tag) {
       remove(c) { this._set.delete(c); },
       toggle(c, on) { if (on) this._set.add(c); else this._set.delete(c); },
       contains(c) { return this._set.has(c); },
+    },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name)
+        ? this.attributes[name]
+        : null;
     },
     textContent: "",
     hidden: false,

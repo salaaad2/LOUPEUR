@@ -472,4 +472,24 @@ tests.push({
   },
 });
 
+tests.push({
+  name: "sequencer: the header badge follows the playback mode",
+  async fn() {
+    const t = load({ sampleRate: RATE });
+    await boot(t);
+    const badge = t.__document.getElementById("modeBadge");
+    const header = t.__document.getElementById("header");
+
+    t.setPlayMode("sequence");
+    assert.strictEqual(badge.textContent, "SEQUENCE");
+    assert.ok(badge.classList.contains("mode-sequence"));
+    assert.ok(header.classList.contains("mode-sequence"));
+
+    t.setPlayMode("loop");
+    assert.strictEqual(badge.textContent, "LOOP");
+    assert.ok(badge.classList.contains("mode-loop"));
+    assert.ok(header.classList.contains("mode-loop"));
+  },
+});
+
 module.exports = tests;

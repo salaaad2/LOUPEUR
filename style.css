@@ -49,7 +49,14 @@ body {
   background: var(--panel);
   border: var(--nb-border) solid var(--line);
   box-shadow: var(--nb-shadow);
+  transition: border-color 0.15s;
 }
+
+/* The playback mode owns the header border, so the current mode is visible
+   without reading the toggle. LOOP is the green transport colour, SEQUENCE the
+   amber arrangement colour. */
+.header.mode-loop { border-color: var(--play); }
+.header.mode-sequence { border-color: var(--dub); }
 
 .header h1 {
   margin: 0;
@@ -74,7 +81,11 @@ body {
   box-shadow: 3px 3px 0 var(--line);
   padding: 4px 10px;
   white-space: nowrap;
+  transition: background 0.15s;
 }
+
+.badge.mode-loop { background: var(--play); }
+.badge.mode-sequence { background: var(--dub); }
 
 /* The playback mode lives in the header, next to the badge, because it changes
    what the whole page does: LOOP plays every track every loop, SEQUENCE plays

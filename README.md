@@ -2,9 +2,10 @@
 
 A looper pedal in the browser (Boss RC-505 mental model). Record up to eight
 synced loop tracks from a microphone, overdub layers, mute and clear them, and
-export the mix as a WAV. Copy a track to the sequencer to arrange it over a
-4/8/16/32-loop pattern. Everything runs client-side; audio never leaves the
-machine. No build step, no dependencies, no backend.
+export the mix or the sequencer arrangement as a WAV. Copy a track to the
+sequencer to arrange it over a 4/8/16/32-loop pattern. Everything runs
+client-side; audio never leaves the machine. No build step, no dependencies, no
+backend.
 
 ```
 index.html            static markup
@@ -50,7 +51,8 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | Click while recording | Keeps the metronome ticking under a take, so you can play to the grid |
 | Microphone | Input picker; `Default input` follows the system default |
 | Reverb / Master | Global send and output level |
-| Export Mix | Renders the unmuted tracks to a 16-bit stereo WAV |
+| Export Mix | Renders the unmuted tracks to a 16-bit stereo WAV, one loop long |
+| Export Sequence | Renders one pass of the sequencer pattern to a 16-bit stereo WAV |
 | Export tracks separately | One `track{n}.wav` per track that holds audio, into a folder you pick, or as downloads where the folder picker is unavailable |
 
 Keyboard: `R` record/punch on the selected track (LOOP mode only), `1`–`8`
@@ -69,7 +71,8 @@ be switched while any track holds audio or the transport runs.
 ### LOOP and SEQUENCE
 
 The switch in the header is the playback mode, and it is independent of the
-recording mode above.
+recording mode above. The header badge and border show the current mode: green
+for **LOOP**, amber for **SEQUENCE**.
 
 **LOOP** is the original behaviour: every track plays every loop, and the
 sequencer grid is inert. You can still fill it; you just cannot hear it.
@@ -87,6 +90,12 @@ still ahead is picked up when its boundary arrives.
 `COPY TO SEQ` is a copy, not a move: the track keeps its audio, its level and
 its mute, and the row is a view of it. An overdub is heard through the row
 without copying again, and clearing the track drops the row with it.
+
+**Export Sequence** renders one pass of the pattern, not one loop: each row's
+filled slots gate its track for the whole pattern, with the same mute, level,
+reverb and master as **Export Mix**. `Loop pattern` is a playback setting; the
+file always contains one pass. The button is disabled until at least one
+unmuted row has a filled slot.
 
 Recording is a LOOP mode action. In SEQUENCE mode the record button reads
 `LOOP ONLY`, because a take recorded there would be silent until it was copied
@@ -143,6 +152,10 @@ The stem tests cover the selection and the naming: one file per track that holds
 audio, numbered by track so an empty track leaves a gap, a muted track still
 gets a file, and the download fallback used where the folder picker is missing.
 
+The sequence export tests cover the selection and the gate schedule: only tracks
+with a filled row and no mute are included, an all-empty row is skipped, and the
+gate holds through runs and ramps only when the value changes.
+
 The sequencer tests cover the step clock and the gate: a slot is one full loop,
 the pattern length can be 4/8/16/32 and rows are padded or truncated when it
 changes, a time before the transport starts reads as the first slot, LOOP mode
@@ -177,11 +190,11 @@ needs a browser and a microphone.
   Bluetooth bridge still lands late. Run **Calibrate** once per microphone. The
   offset applies to every take on every track, including the first one, and the
   readout next to the Latency label always shows the number in force.
-- Export renders one loop plus a 1 s reverb tail, trimmed to the loop length.
-- **The export ignores the sequencer pattern.** `Export Mix` and the stems
-  render one loop of the tracks, not the multi-loop arrangement: a track that
-  plays on slots 1 and 3 appears once in the file. The pattern is a playback
-  arrangement, not part of the material yet.
+- Export Mix and the stems render one loop plus a 1 s reverb tail, trimmed to
+  the loop length.
+- **Export Mix and the stems ignore the sequencer pattern.** They render one
+  loop of the tracks, not the arrangement: a track that plays on slots 1 and 3
+  appears once in the file. Use **Export Sequence** for one pass of the grid.
 - **Export tracks separately prefers a folder, and falls back to downloads.**
   The folder path uses the File System Access API (`showDirectoryPicker`).
   Firefox and Safari do not have it, and Brave turns it off by default

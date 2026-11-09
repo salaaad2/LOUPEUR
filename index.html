@@ -5,20 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Loupeur</title>
 <link rel="stylesheet" href="index.min.css">
-<link rel="stylesheet" href="style.css?v=20261109">
+<link rel="stylesheet" href="style.css?v=20261109-3">
 </head>
 <body>
 
 <div id="banner" class="banner" hidden></div>
 
-<header class="header nb-navbar">
+<header class="header nb-navbar mode-loop" id="header">
   <h1 class="nb-navbar-brand">Loupeur</h1>
   <div class="header-right">
     <div class="segmented play-mode" id="playMode" role="group" aria-label="Playback mode">
-      <button type="button" data-playmode="loop" class="nb-button on">Loop</button>
-      <button type="button" data-playmode="sequence" class="nb-button">Sequence</button>
+      <button type="button" data-playmode="loop" class="nb-button on" aria-pressed="true">Loop</button>
+      <button type="button" data-playmode="sequence" class="nb-button" aria-pressed="false">Sequence</button>
     </div>
-    <span class="badge">it loops</span>
+    <span class="badge mode-badge mode-loop" id="modeBadge">LOOP</span>
   </div>
 </header>
 
@@ -116,6 +116,7 @@
       <input type="checkbox" id="stems" class="nb-checkbox">
     </div>
     <button type="button" id="export" class="nb-button orange export">Export Mix</button>
+    <button type="button" id="exportSeq" class="nb-button export" title="Export one pass of the sequencer pattern">Export Sequence</button>
   </section>
 
   <section class="panel help nb-card">
@@ -129,6 +130,6 @@
 
 </main>
 
-<script src="app.js?v=20261109"></script>
+<script src="app.js?v=20261109-3"></script>
 </body>
 </html>

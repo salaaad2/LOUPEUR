@@ -108,6 +108,8 @@ let exportingStems = false;  // a folder export is running, see exportStems
 
 const el = {
   banner: document.getElementById("banner"),
+  header: document.getElementById("header"),
+  modeBadge: document.getElementById("modeBadge"),
   tracks: document.getElementById("tracks"),
   bpm: document.getElementById("bpm"),
   bpmOut: document.getElementById("bpmOut"),
@@ -120,6 +122,7 @@ const el = {
   master: document.getElementById("master"),
   masterOut: document.getElementById("masterOut"),
   exportBtn: document.getElementById("export"),
+  exportSeq: document.getElementById("exportSeq"),
   stems: document.getElementById("stems"),
   modeHelp: document.getElementById("modeHelp"),
   calibrate: document.getElementById("calibrate"),
@@ -1246,6 +1249,23 @@ function setSeqSteps(n) {
   render();
 }
 
+// Schedules one row's gate across a whole pattern. `steps` is the row's filled
+// slots and `slotSeconds` is one full loop. The gate holds through runs of the
+// same value and ramps only when the value changes, so a filled run is one
+// continuous gain rather than a ramp at every boundary.
+function scheduleSeqGate(param, steps, slotSeconds) {
+  let prev = steps[0] ? 1 : 0;
+  param.setValueAtTime(prev, 0);
+  for (let s = 1; s < steps.length; s++) {
+    const value = steps[s] ? 1 : 0;
+    if (value === prev) continue;
+    const at = s * slotSeconds;
+    param.setValueAtTime(prev, at);
+    param.linearRampToValueAtTime(value, at + RAMP_SECONDS);
+    prev = value;
+  }
+}
+
 // Fills or empties one slot. The gate for the slot that is playing right now
 // changes with the click, so it is applied now: waiting a whole pattern to hear
 // a cell you just filled reads as broken. A slot that is not playing yet is
@@ -1729,14 +1749,15 @@ function playClick(when, accent, cancellable = true) {
 // ---------------------------------------------------------------------------
 
 // Renders `channels` through the export graph: per-track level, reverb send,
-// master. One loop plus the reverb tail, trimmed to the loop length. The mix
-// export and the stems both come through here, so a stem is exactly the track's
-// contribution to the mix.
-async function renderChannels(channels) {
-  const L = channels[0].buffer.length;
+// master. By default one loop plus the reverb tail, trimmed to the loop length.
+// `opts.frames` renders a longer span and `opts.gate` inserts the sequencer gate
+// in front of the level; the mix, the stems and the sequence export all come
+// through here, so a stem is exactly the track's contribution to the mix.
+async function renderChannels(channels, opts = {}) {
   const rate = ctx.sampleRate;
+  const frames = opts.frames || channels[0].buffer.length;
   const tail = Math.round(EXPORT_TAIL * rate);
-  const offline = new OfflineAudioContext(2, L + tail, rate);
+  const offline = new OfflineAudioContext(2, frames + tail, rate);
 
   const master = offline.createGain();
   master.gain.value = state.master;
@@ -1756,18 +1777,28 @@ async function renderChannels(channels) {
   for (const ch of channels) {
     const src = offline.createBufferSource();
     src.buffer = ch.buffer;
+    // The sequence export plays one source across the whole pattern, so it has
+    // to loop; the one-loop mix and stems stop at the end of their buffer.
+    src.loop = Boolean(opts.loop);
     // The per-track level is part of the mix, so the render has to apply it: an
     // export that ignored the sliders would not be what the user hears.
     const level = offline.createGain();
     level.gain.value = state.volumes[ch.index];
-    src.connect(level);
+    if (opts.gate) {
+      const gate = offline.createGain();
+      opts.gate(gate, ch);
+      src.connect(gate);
+      gate.connect(level);
+    } else {
+      src.connect(level);
+    }
     level.connect(dry);
     level.connect(conv);
     src.start(0);
   }
 
   const rendered = await offline.startRendering();
-  return encodeWav(rendered, L);
+  return encodeWav(rendered, frames);
 }
 
 async function exportMix() {
@@ -1777,6 +1808,43 @@ async function exportMix() {
     return;
   }
   download(await renderChannels(active), "loop-mix.wav");
+}
+
+// The tracks the sequence mix contains: a buffer, a row with at least one filled
+// slot, and not muted. Mute is part of what Export Mix means, so the sequence
+// mix follows the same rule.
+function sequenceExportTracks() {
+  return state.channels.filter((ch) => {
+    const row = state.seqRows[ch.index];
+    return ch.buffer && !ch.muted && row && row.steps.some(Boolean);
+  });
+}
+
+// One pass of the sequencer pattern. Every source loops for the whole render and
+// the gate opens and closes on the slot boundaries, so the file is the same
+// arrangement the live sequencer plays. The reverb tail is rendered and trimmed
+// exactly like Export Mix.
+async function exportSequence() {
+  const active = sequenceExportTracks();
+  if (!active.length) {
+    showBanner("Nothing to export. Copy a track to the sequencer and fill a slot first.");
+    return;
+  }
+  const L = loopSamples();
+  if (!L) {
+    showBanner("Nothing to export. Record a loop first.");
+    return;
+  }
+  const frames = state.seqSteps * L;
+  const slotSeconds = L / ctx.sampleRate;
+  const wav = await renderChannels(active, {
+    frames,
+    loop: true,
+    gate(gate, ch) {
+      scheduleSeqGate(gate.gain, state.seqRows[ch.index].steps, slotSeconds);
+    },
+  });
+  download(wav, "sequence-mix.wav");
 }
 
 // The tracks that get a file, and the name each one gets. Numbered by track, not
@@ -2445,12 +2513,28 @@ function render() {
     tile.classList.toggle("seq-silent", state.playMode === "sequence" && !state.seqRows[i]);
   }
 
+  const sequence = state.playMode === "sequence";
   for (const b of el.playMode.children) {
-    b.classList.toggle("on", b.dataset.playmode === state.playMode);
+    const on = b.dataset.playmode === state.playMode;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+  }
+  // The header badge and border carry the mode at a glance, so the state is
+  // visible even when the eye is on the tracks or the sequencer.
+  if (el.modeBadge) {
+    const modeLabel = sequence ? "SEQUENCE" : "LOOP";
+    if (el.modeBadge.textContent !== modeLabel) el.modeBadge.textContent = modeLabel;
+    el.modeBadge.classList.toggle("mode-sequence", sequence);
+    el.modeBadge.classList.toggle("mode-loop", !sequence);
+  }
+  if (el.header) {
+    el.header.classList.toggle("mode-sequence", sequence);
+    el.header.classList.toggle("mode-loop", !sequence);
   }
 
   const hasAudio = state.channels.some((c) => c.buffer);
   el.exportBtn.disabled = !hasAudio;
+  if (el.exportSeq) el.exportSeq.disabled = !sequenceExportTracks().length;
   // The stems checkbox is an action, not a mode: it is only live while there is
   // something to write and no export is already running.
   el.stems.disabled = exportingStems || !hasAudio;
@@ -2598,6 +2682,12 @@ function bindControls() {
   el.exportBtn.addEventListener("click", () => {
     exportMix().catch((err) => showBanner("Export failed: " + err.message));
   });
+
+  if (el.exportSeq) {
+    el.exportSeq.addEventListener("click", () => {
+      exportSequence().catch((err) => showBanner("Export failed: " + err.message));
+    });
+  }
 
   // Checking the box is the whole gesture: it opens the folder picker, writes
   // the stems and unchecks itself, so a second export is one click away and a

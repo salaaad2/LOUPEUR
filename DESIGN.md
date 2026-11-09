@@ -392,9 +392,11 @@ that ignored the sliders would not be the mix the user hears.
 
 ## A stem is the mix, one track at a time
 
-`renderChannels()` builds the export graph and is the only place it is built.
+`renderChannels()` builds the export graph and is the only place it is built. It
+can render a longer frame count and insert a per-track sequencer gate.
 `exportMix()` hands it every unmuted track; `exportStems()` hands it one track
-at a time. A stem therefore carries the same per-track level, reverb send and
+at a time; `exportSequence()` hands it the tracks with filled rows and a gate
+schedule. A stem therefore carries the same per-track level, reverb send and
 master as the mix, and the stems sum to the mix when nothing is muted.
 
 Mute is not applied to a stem. It is a performance state, not part of the
@@ -416,6 +418,20 @@ The checkbox is the trigger, not a mode: it opens the picker, writes the files
 and unchecks itself, so a second export is one click away and a cancelled picker
 leaves nothing behind. `exportingStems` keeps `render()` from re-enabling the
 box while the writes are in flight.
+
+## The sequence export is one pass of the gate
+
+`exportSequence()` renders `state.seqSteps × L` frames, one pass of the pattern.
+Every source loops for the whole render and a gain node in front of the level
+applies the row's filled slots, using the same slot length as the live
+sequencer. The gate holds through runs and ramps only when the value changes, so
+a filled run is continuous. Mute is applied like Export Mix; stems still ignore
+it. The reverb tail is rendered and trimmed exactly like Export Mix, so the file
+ends at the pattern boundary.
+
+`Loop pattern` is a playback setting: the export always contains one pass, not a
+fixed number of repeats. A track with no row, an all-empty row, or a muted track
+is not in the file.
 
 ## Signal graph
 
@@ -442,5 +458,5 @@ node disconnect, so toggling never clicks.
   50 ms or it is rejected.
 - **No punch-out of a fixed-length take.** A later Free Mode track and an overdub
   both run to the end of the loop.
-- **No pattern export.** The export renders one loop of the tracks, not the
-  multi-loop arrangement. The pattern is a playback arrangement, not material.
+- **No looping sequence export.** `Export Sequence` renders one pass of the
+  pattern. `Loop pattern` is a playback setting; the file is the arrangement.
