@@ -10,7 +10,7 @@ Browser-based basic DAW for my personal use.
 - microphone lag compensator
 - usable by absolute beginners
 
-![LOUPEUR](image.png)
+![LOUPEUR](./LOUPEUR.png)
 
 ## Run it
 
