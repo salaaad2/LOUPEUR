@@ -26,6 +26,91 @@ The fold weights are **linear**, not equal-power. Both halves are the same
 signal, so the weights must sum to 1; equal-power weights sum to 1.41 at the
 midpoint and put a 20% amplitude bump on every sustained note at the loop point.
 
+## An imported WAV is the loop, untouched
+
+A WAV may be imported only while the app holds no material: `importBlocked()` is
+true if any channel has a buffer, a take is live, or the transport runs. Once a
+loop exists, a second import would have to match it, so the simple rule is that
+the file starts the session.
+
+The decoded buffer's **exact** sample count becomes `state.loopLength`, and the
+app is put in Free Mode. Tempo Lock's length is derived from
+`bars × 4 × (60/BPM) × sampleRate`; routing an import through that grid would
+trim or pad every file that is not exactly a whole number of bars, which is not
+what "the loop fits the file" means. The BPM the user enters is stored in
+`state.bpm` and drives the click and later takes; it never changes the imported
+length. A later BPM change does not move the loop either, because Free Mode owns
+the length.
+
+The file is not seam-folded, faded, trimmed or padded. `foldSeam()` exists for
+takes that were captured with an extra tail; an imported file is assumed to be
+authored as a loop, and crossfading it would alter the material.
+
+Mono stays mono and stereo stays stereo (channels above two are ignored). The
+buffer is copied at `ctx.sampleRate` because `decodeAudioData` has already
+resampled it. `commitOverdub()` preserves `old.numberOfChannels` and sums the
+mono overdub into every channel, so the first overdub on an imported stereo
+track does not silently drop its right channel. The waveform envelope takes the
+peak across channels for the same reason: a hard-panned mix still draws a wave.
+
+The import button is disabled by `render()` whenever `canImport()` is false;
+`importDecodedBuffer()` repeats the guard because a test or a shortcut can reach
+it directly. Clearing the last track drops `loopLength` and makes import
+available again.
+
+`state.freshLoop` is set by an import and cleared by `startTransport()`. The
+first Space after an import starts at `now`, not at `nextBoundaryTime()`: a
+stopped transport still holds the previous `t0`, and the next multiple of a
+long imported loop can be most of a loop away. Waiting there is indistinguishable
+from a broken import.
+
+Import also sets `state.playMode` to `"loop"`. A fresh track has no sequencer
+row, so SEQUENCE would gate it off; the user can switch back after copying it to
+the grid.
+
+## A project is one self-contained file
+
+A `.loupeur` project is a dependency-free binary container:
+
+```
+0..7    "LOUPEURP"
+8..11   uint32 LE format version
+12..15  uint32 LE manifest length
+16..    UTF-8 JSON manifest
+..      one 16-bit WAV per non-empty track
+```
+
+The manifest carries the persistent GUI: BPM, bars, Free/Tempo mode, click
+settings, reverb, master, LOOP/SEQUENCE, slot count, loop-pattern, selected
+track, track count, per-track volume/mute/layers, the sequencer rows and the
+loop length. It does **not** carry the microphone, the per-device latency
+calibration, the transport position or the waveform envelopes: those belong to
+the machine or are derived.
+
+Audio is encoded with `encodeWavBytes()`, the same 16-bit PCM the exports use,
+and decoded with `decodeAudioData()`. The project is therefore playable at the
+current AudioContext rate: a 48 kHz project opened at 44.1 kHz is resampled by
+the decoder, and every track is resampled the same way. The `encoding` field is
+per track so a later version can add float or compressed payloads without
+changing the container.
+
+`readProject()` validates the header, version, manifest, track count, audio
+offsets/lengths, sequencer arrays and every numeric range **before** decoding
+anything. `applyProject()` then builds the new channel graph before retiring the
+old one. A malformed or truncated file must leave the current session intact:
+that is the reason both steps are separated from `loadProjectFile()`'s file read.
+
+A loaded project is stopped and has `state.freshLoop = true`, so the first Space
+starts it immediately. If the manifest says Tempo Lock but the decoded loop
+length no longer equals `bars × 4 × (60/BPM) × sampleRate`, the project loads in
+Free Mode instead. Loading must not let a stale grid redefine the loop under the
+audio.
+
+Saving and loading are disabled while a take is live, calibration/import/export
+is running, or the other project operation is in flight. The Project buttons are
+the only writers of the `.loupeur` format; the export buttons still render the
+live mix, not the project file.
+
 ## Offsets are taken against the buffer, not the grid
 
 `loopOffset()` reduces modulo `ch.buffer.length`. In Free Mode the buffer is
@@ -456,6 +541,11 @@ node disconnect, so toggling never clicks.
 - **No live monitoring.** The mic is not routed to the destination.
 - **No stretching or padding.** A later Free Mode take must match `L` within
   50 ms or it is rejected.
+- **No BPM quantisation of imports.** An imported WAV's exact duration is the
+  loop; the BPM prompt only configures the click and later takes.
+- **No compressed project container.** A project is the versioned header, JSON
+  manifest and 16-bit WAV payloads; adding ZIP/FLAC would mean a dependency or a
+  second parser for no gain at loop-length sizes.
 - **No punch-out of a fixed-length take.** A later Free Mode track and an overdub
   both run to the end of the loop.
 - **No looping sequence export.** `Export Sequence` renders one pass of the

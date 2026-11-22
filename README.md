@@ -39,21 +39,24 @@ Desktop Chrome, Edge, Safari and Firefox. Mobile is not a target.
 | `CLEAR` | Long-press (~600 ms) wipes the track |
 | Track volume | Per-track level, applied to playback and to the export |
 | Add track | Appends an empty track, up to eight |
+| Import WAV | Imports one `.wav` as the first track; the file's exact duration sets the loop and the app asks for its BPM. Only available while every track is empty |
 | `REMOVE` | Drops a track that holds no audio; disabled once it has a take |
 | BPM / Bars | Tempo Lock grid: 60–180 BPM, 1/2/4/8 bars |
-| Mode | Free (first take sets the length) or Tempo Lock (grid + count-in) |
+| Mode | Free (first take or imported WAV sets the length) or Tempo Lock (grid + count-in) |
 | Playback mode (header) | `LOOP` plays every track every loop; `SEQUENCE` plays only the slots the grid has filled |
 | `COPY TO SEQ` | Adds the track to the sequencer as a row; press again to remove it |
 | Sequencer slot | One full loop. Click to fill (`X`) or empty it |
 | Sequencer slots | 4/8/16/32 slots per pattern; each slot is one full loop |
 | Loop pattern | On: the pattern repeats. Off: the pattern plays once and stops the transport |
-| Click track | Count-in and metronome, Tempo Lock only. Never recorded or exported |
+| Click track | Count-in (Tempo Lock) and the metronome under a take. Never recorded or exported |
 | Click while recording | Keeps the metronome ticking under a take, so you can play to the grid |
 | Microphone | Input picker; `Default input` follows the system default |
 | Reverb / Master | Global send and output level |
 | Export Mix | Renders the unmuted tracks to a 16-bit stereo WAV, one loop long |
 | Export Sequence | Renders one pass of the sequencer pattern to a 16-bit stereo WAV |
 | Export tracks separately | One `track{n}.wav` per track that holds audio, into a folder you pick, or as downloads where the folder picker is unavailable |
+| Save project | Downloads a self-contained `.loupeur` file with the GUI state and every track |
+| Load project | Restores a `.loupeur` project; asks before replacing a session that already has audio |
 
 Keyboard: `R` record/punch on the selected track (LOOP mode only), `1`–`8`
 select a track, `Space` stop/resume.
@@ -64,9 +67,51 @@ select a track, `Space` stop/resume.
 take gets a 4-beat count-in and records exactly one loop, then stops on its own.
 Later takes punch in at the next loop boundary.
 
-**Free Mode** has no grid. The first take defines the loop length when you punch
-out; every later take must match it within 50 ms or it is rejected. Mode cannot
-be switched while any track holds audio or the transport runs.
+**Free Mode** has no grid. The first take, or an imported WAV, defines the loop
+length; every later take must match it within 50 ms or it is rejected. Mode
+cannot be switched while any track holds audio or the transport runs.
+
+### Importing a WAV
+
+**Import WAV** is a start-of-session action: it is available only while every
+track is empty, and it loads the file into the selected track. The file must be
+`.wav`; mono is kept mono and stereo is kept stereo. The decoded file's exact
+duration becomes the loop length — the app does not trim or pad it — and the app
+switches to **Free** mode, because Tempo Lock derives its loop from BPM and bars.
+The BPM you enter is used for the click and for later takes, not to quantise the
+file. Playback switches to **LOOP**, because the new track has no sequencer row
+yet and would be silent in SEQUENCE. An imported track behaves like a recorded
+one: mute, volume, overdub, copy to the sequencer and export all work. Clearing
+every track makes import available again.
+
+### Saving and loading projects
+
+**Save** in the Project group downloads one `.loupeur` file. **Load** opens one
+back. The project is self-contained: it carries the GUI state and one 16-bit
+WAV per track that holds audio.
+
+The file is a small binary container:
+
+| Offset | Size | Content |
+|---|---|---|
+| 0 | 8 | ASCII magic `LOUPEURP` |
+| 8 | 4 | little-endian format version (`1`) |
+| 12 | 4 | little-endian manifest length |
+| 16 | … | UTF-8 JSON manifest |
+| … | … | one 16-bit WAV per non-empty track |
+
+The manifest holds BPM, bars, Free/Tempo mode, click settings, reverb, master,
+LOOP/SEQUENCE, slot count, loop-pattern, selected track, track count, per-track
+volume/mute/layer count, the sequencer rows, and the loop length. Track audio is
+stored as WAV, so `decodeAudioData` resamples it if the project is opened at a
+different sample rate.
+
+Loading validates the whole file and decodes every track before it replaces the
+current session, so a bad file leaves the audio and GUI intact. The transport
+loads stopped, and the first `Space` starts immediately. If a Tempo Lock project's
+audio no longer matches its BPM/bars grid, it loads in **Free** mode instead of
+silently redefining the grid. Microphone choice, latency calibration and the
+transport position are not part of a project.
 
 ### LOOP and SEQUENCE
 
@@ -152,6 +197,16 @@ The stem tests cover the selection and the naming: one file per track that holds
 audio, numbered by track so an empty track leaves a gap, a muted track still
 gets a file, and the download fallback used where the folder picker is missing.
 
+The import tests cover the exact-duration rule, the Free Mode switch, the
+mono/stereo copy, the "empty session only" guard, the BPM range, the length
+limits, import becoming available again after everything is cleared, and a
+stereo track surviving an overdub.
+
+The project tests cover the manifest, the binary container round-trip, rejecting
+malformed files before anything changes, restoring the GUI/audio/sequencer, and
+the Tempo Lock to Free Mode fallback when a saved grid no longer matches the
+audio.
+
 The sequence export tests cover the selection and the gate schedule: only tracks
 with a filled row and no mute are included, an all-empty row is skipped, and the
 gate holds through runs and ramps only when the value changes.
@@ -195,6 +250,15 @@ needs a browser and a microphone.
 - **Export Mix and the stems ignore the sequencer pattern.** They render one
   loop of the tracks, not the arrangement: a track that plays on slots 1 and 3
   appears once in the file. Use **Export Sequence** for one pass of the grid.
+- **An imported WAV is the whole loop.** It is not trimmed, padded, faded or
+  quantised to the BPM grid, so the file must already loop cleanly. Import is
+  available only before any track holds audio: one file starts the session, and
+  a later file would have to match the loop it already defined.
+- **Project audio is 16-bit PCM.** It is the same quantisation as Export Mix:
+  samples above full scale are clipped when a project is saved, and a save/load
+  round trip can move a sample by one LSB. The format reserves an `encoding`
+  field, so a future version can add float or compressed payloads without
+  changing the container.
 - **Export tracks separately prefers a folder, and falls back to downloads.**
   The folder path uses the File System Access API (`showDirectoryPicker`).
   Firefox and Safari do not have it, and Brave turns it off by default

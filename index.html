@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Loupeur</title>
 <link rel="stylesheet" href="index.min.css">
-<link rel="stylesheet" href="style.css?v=20261109-3">
+<link rel="stylesheet" href="style.css?v=20261121-1">
 </head>
 <body>
 
@@ -75,6 +75,8 @@
   <section class="tracks-section">
     <div class="tracks" id="tracks"></div>
     <div class="tracks-actions">
+      <input type="file" id="importFile" accept=".wav,audio/wav,audio/x-wav" hidden>
+      <button type="button" id="importWav" class="nb-button add-track" title="Import a WAV as the first track">Import WAV</button>
       <button type="button" id="addTrack" class="nb-button add-track">+ Add track</button>
     </div>
   </section>
@@ -104,6 +106,14 @@
 
   <section class="panel output nb-card">
     <div class="control">
+      <span class="nb-label">Project</span>
+      <div class="segmented">
+        <button type="button" id="saveProject" class="nb-button" title="Save the current session as a .loupeur project">Save</button>
+        <button type="button" id="loadProject" class="nb-button" title="Load a .loupeur project and replace the current session">Load</button>
+      </div>
+      <input type="file" id="projectFile" accept=".loupeur" hidden>
+    </div>
+    <div class="control">
       <label class="nb-label" for="reverb">Reverb</label>
       <input type="checkbox" id="reverb" class="nb-checkbox">
     </div>
@@ -130,6 +140,6 @@
 
 </main>
 
-<script src="app.js?v=20261109-3"></script>
+<script src="app.js?v=20261122-1"></script>
 </body>
 </html>

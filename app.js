@@ -46,6 +46,13 @@ const CLEAR_HOLD_MS = 600;
 const WAVE_BUCKETS = 200;
 const EXPORT_TAIL = 1;           // seconds of reverb tail
 
+// Projects. One self-contained file: a small header, a UTF-8 JSON manifest,
+// then one 16-bit WAV per non-empty track. See DESIGN.md.
+const PROJECT_MAGIC = "LOUPEURP";
+const PROJECT_FORMAT = "loupeur-project";
+const PROJECT_VERSION = 1;
+const PROJECT_MIME = "application/octet-stream";
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -78,6 +85,7 @@ const state = {
   transport: "stopped",  // "stopped" | "running"
   loopLength: 0,         // samples; 0 = no loop exists yet
   t0: 0,                 // AudioContext time of loop sample 0
+  freshLoop: false,      // imported but never started: Space starts at once
   channels: [],
 };
 
@@ -101,6 +109,9 @@ let liveEnv = null;          // envelope of the take in progress, for the wavefo
 let countInOscs = [];        // clicks of a count-in that has not finished yet
 let calibration = null;      // the round-trip measurement in progress, see calibrate
 let exportingStems = false;  // a folder export is running, see exportStems
+let importing = false;       // a WAV is being decoded and installed, see importWav
+let savingProject = false;   // a project file is being written, see saveProjectFile
+let loadingProject = false;  // a project file is being read, see loadProjectFile
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -134,6 +145,11 @@ const el = {
   seqLength: document.getElementById("seqLength"),
   seqHelp: document.getElementById("seqHelp"),
   addTrack: document.getElementById("addTrack"),
+  importWav: document.getElementById("importWav"),
+  importFile: document.getElementById("importFile"),
+  saveProject: document.getElementById("saveProject"),
+  loadProject: document.getElementById("loadProject"),
+  projectFile: document.getElementById("projectFile"),
 };
 
 // ---------------------------------------------------------------------------
@@ -177,8 +193,9 @@ async function initAudio() {
 }
 
 // Builds one channel and wires it into the graph. Called for every track when
-// the audio graph is created, and again when a track is added after that.
-function createChannel(i) {
+// the audio graph is created, when a track is added, and into a temporary list
+// when a project is loaded (so the old session stays intact if this throws).
+function createChannel(i, list = state.channels) {
   const gain = ctx.createGain();
   gain.gain.value = 1;
   gain.connect(dryGain);
@@ -189,7 +206,7 @@ function createChannel(i) {
   const seqGain = ctx.createGain();
   seqGain.gain.value = 1;
   seqGain.connect(gain);
-  state.channels.push({
+  list.push({
     index: i,
     state: "empty",
     buffer: null,
@@ -880,6 +897,7 @@ function nextBoundaryTime(after) {
 function startTransport(atTime) {
   state.transport = "running";
   state.t0 = atTime;
+  state.freshLoop = false;
   // t0 may be in the past (Free Mode back-dating), so begin at the first
   // boundary that has not already gone by.
   const Lsec = loopSamples() / ctx.sampleRate;
@@ -1603,17 +1621,732 @@ function beginOverdub(ch) {
 
 function commitOverdub(ch, scratch, take) {
   const old = ch.buffer;
-  const buf = ctx.createBuffer(1, old.length, old.sampleRate);
-  const data = buf.getChannelData(0);
-  data.set(old.getChannelData(0));
+  // Keep the imported track's channel count: a stereo file stays stereo, and
+  // the mono overdub is summed into every channel. Collapsing to mono here
+  // silently dropped the right channel of an imported mix on its first overdub.
+  const buf = ctx.createBuffer(old.numberOfChannels, old.length, old.sampleRate);
   // The take starts at scratch index 0, which is the loop boundary: the window
   // was opened `shift` after it and the anchor is the prediction, so the layer
   // lines up with the buffer it is added to. `take` is the loop length, not the
   // whole window, so the slack is not folded in.
   const add = scratch.subarray(0, Math.min(take, old.length));
-  for (let i = 0; i < add.length; i++) data[i] += add[i];
+  for (let c = 0; c < old.numberOfChannels; c++) {
+    const data = buf.getChannelData(c);
+    data.set(old.getChannelData(c));
+    for (let i = 0; i < add.length; i++) data[i] += add[i];
+  }
   ch.buffer = buf;
   ch.layers++;
+}
+
+// ---------------------------------------------------------------------------
+// Import
+// ---------------------------------------------------------------------------
+
+// True once there is material in the app: any track buffer or a take that has
+// not committed yet. An import is only allowed before that point.
+function importBlocked() {
+  return (
+    state.transport === "running" ||
+    Boolean(pendingRecord) ||
+    state.channels.some((ch) => ch.buffer)
+  );
+}
+
+// The button state. `importing` covers the decode/prompt window, where no
+// buffer exists yet but a second picker would race the first.
+function canImport() {
+  return !importing && !loadingProject && !importBlocked();
+}
+
+function isWavFilename(name) {
+  return /\.wav$/i.test(name || "");
+}
+
+// decodeAudioData is promise-based in current browsers and callback-based in
+// older ones. Settle on whichever fires first.
+function decodeWav(data) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (buffer) => {
+      if (settled) return;
+      settled = true;
+      resolve(buffer);
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    try {
+      const result = ctx.decodeAudioData(data, done, fail);
+      if (result && typeof result.then === "function") result.then(done, fail);
+    } catch (err) {
+      fail(err);
+    }
+  });
+}
+
+// BPM is metadata for the click and for later takes: the loop itself is always
+// the file's exact length. Returns null when the user cancels, and NaN for an
+// answer outside the app's range so the caller can prompt again.
+function askImportBpm(name) {
+  let raw;
+  try {
+    raw = window.prompt(`BPM of "${name}" (60–180):`, String(state.bpm));
+  } catch (_) {
+    return null;
+  }
+  if (typeof raw !== "string") return null;
+  const bpm = Math.round(Number(raw));
+  if (!Number.isFinite(bpm) || bpm < 60 || bpm > 180) return NaN;
+  return bpm;
+}
+
+// Copies the decoded file at the audio context's rate. Mono stays mono and
+// stereo stays stereo; extra channels are ignored. The exact sample count
+// becomes the loop length, so the file is never trimmed or padded.
+function importDecodedBuffer(decoded, bpm, index = state.selected) {
+  if (!ctx || !decoded) return false;
+  if (importBlocked()) return false;
+  const safeBpm = Math.round(Number(bpm));
+  if (!Number.isFinite(safeBpm) || safeBpm < 60 || safeBpm > 180) return false;
+  const seconds = decoded.length / ctx.sampleRate;
+  if (seconds < MIN_LOOP_SECONDS || seconds > MAX_TAKE_SECONDS) return false;
+
+  const ch = state.channels[index];
+  if (!ch) return false;
+
+  const channels = Math.min(2, decoded.numberOfChannels);
+  const buf = ctx.createBuffer(channels, decoded.length, ctx.sampleRate);
+  for (let c = 0; c < channels; c++) {
+    buf.getChannelData(c).set(decoded.getChannelData(c));
+  }
+
+  if (ch.source) {
+    try { ch.source.stop(); } catch (_) {}
+    ch.source = null;
+  }
+
+  state.bpm = safeBpm;
+  if (el.bpm) el.bpm.value = String(safeBpm);
+  if (el.bpmOut) el.bpmOut.textContent = String(safeBpm);
+
+  // Tempo Lock derives the loop from BPM and bars, which would disagree with
+  // the file unless it happens to be a whole number of bars. Free Mode owns the
+  // length instead, so the imported file plays at exactly its own duration.
+  state.mode = "free";
+  for (const b of el.mode.children) b.classList.toggle("on", b.dataset.mode === "free");
+
+  state.loopLength = buf.length;
+  // An imported file has no grid to wait for: the first Space should start it
+  // now, not at the next multiple of its length measured from a stale t0.
+  state.freshLoop = true;
+  state.selected = index;
+  ch.buffer = buf;
+  ch.layers = 1;
+  ch.state = "playing";
+  ch.muted = false;
+  ch.muteAt = 0;
+  ch.envBuffer = null;
+  ch.env = null;
+
+  // Respect a level set before the graph existed, and clear any gate left from
+  // an earlier loop on this tile.
+  const now = ctx.currentTime;
+  ch.gain.gain.cancelScheduledValues(now);
+  ch.gain.gain.setValueAtTime(channelTarget(ch), now);
+  ch.seqGain.gain.cancelScheduledValues(now);
+  ch.seqGain.gain.setValueAtTime(1, now);
+
+  // With no material there are no sequencer rows, so LOOP makes the import
+  // audible immediately instead of leaving it gated off.
+  state.playMode = "loop";
+
+  render();
+  return true;
+}
+
+async function importWav(file) {
+  if (!file) return;
+  if (!isWavFilename(file.name)) {
+    showBanner("Only .wav files can be imported.");
+    return;
+  }
+  if (!canImport()) {
+    showBanner("Import is only available before any track holds audio.");
+    return;
+  }
+
+  importing = true;
+  render();
+  try {
+    await initAudio();
+    const data = await file.arrayBuffer();
+    const decoded = await decodeWav(data);
+    const seconds = decoded.length / ctx.sampleRate;
+    if (seconds < MIN_LOOP_SECONDS) {
+      showBanner("That WAV is too short. Import at least half a second.");
+      return;
+    }
+    if (seconds > MAX_TAKE_SECONDS) {
+      showBanner("That WAV is too long. Import at most 8 minutes.");
+      return;
+    }
+
+    let bpm = askImportBpm(file.name);
+    while (Number.isNaN(bpm)) bpm = askImportBpm(file.name);
+    if (bpm === null) return;
+
+    if (!importDecodedBuffer(decoded, bpm)) {
+      showBanner("Could not import that WAV.");
+      return;
+    }
+    showBanner(
+      `Imported ${file.name} — ${seconds.toFixed(2)} s at ${state.bpm} BPM. Press Space to play.`
+    );
+  } catch (err) {
+    console.warn("[loupeur] import failed:", err);
+    showBanner("Could not read that WAV. Choose an uncompressed .wav file.");
+  } finally {
+    importing = false;
+    // The hidden file input keeps focus after the picker closes, and the
+    // keyboard shortcuts ignore input elements. Return focus to the page.
+    if (el.importFile) el.importFile.blur();
+    render();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+// A project file is one binary container:
+//
+//   0..7    "LOUPEURP"
+//   8..11   uint32 LE format version
+//   12..15  uint32 LE manifest length
+//   16..    UTF-8 JSON manifest
+//   ..      concatenated 16-bit WAV files
+//
+// Audio offsets in the manifest are relative to the first WAV. The container is
+// deliberately dependency-free: the WAVs go through the same encodeWavBytes()
+// and decodeAudioData() the rest of the app already uses.
+function projectBusy() {
+  return (
+    savingProject ||
+    loadingProject ||
+    Boolean(pendingRecord) ||
+    Boolean(calibration) ||
+    importing ||
+    exportingStems
+  );
+}
+
+function isProjectFilename(name) {
+  return /\.loupeur$/i.test(name || "");
+}
+
+function projectFileName() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `loupeur-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.loupeur`;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+// Gathers the persistent GUI state and one WAV payload per non-empty track.
+// The buffers are raw track material: no volume, mute, reverb or master, which
+// all live in the manifest and are applied again on load.
+function projectManifest() {
+  const tracks = [];
+  const payload = [];
+  let offset = 0;
+
+  for (let i = 0; i < state.trackCount; i++) {
+    const ch = state.channels[i];
+    const buffer = ch && ch.buffer;
+    let audio = null;
+    if (buffer) {
+      const bytes = encodeWavBytes(buffer, buffer.length);
+      audio = {
+        offset,
+        length: bytes.byteLength,
+        encoding: "wav-pcm16",
+        channels: buffer.numberOfChannels,
+        frames: buffer.length,
+        sampleRate: buffer.sampleRate,
+      };
+      offset += bytes.byteLength;
+      payload.push(bytes);
+    }
+    tracks.push({
+      volume: Number.isFinite(state.volumes[i]) ? state.volumes[i] : 1,
+      muted: Boolean(ch && ch.muted),
+      layers: buffer ? Math.max(1, Number(ch.layers) || 1) : 0,
+      audio,
+    });
+  }
+
+  return {
+    manifest: {
+      format: PROJECT_FORMAT,
+      version: PROJECT_VERSION,
+      savedAt: new Date().toISOString(),
+      gui: {
+        bpm: state.bpm,
+        bars: state.bars,
+        mode: state.mode,
+        clickOn: state.clickOn,
+        clickWhileRecording: state.clickWhileRecording,
+        reverbOn: state.reverbOn,
+        master: state.master,
+        playMode: state.playMode,
+        seqLoop: state.seqLoop,
+        seqSteps: state.seqSteps,
+        selectedTrack: state.selected,
+      },
+      loop: {
+        frames: state.loopLength,
+        sampleRate: ctx ? ctx.sampleRate : 0,
+      },
+      tracks,
+      sequencer: {
+        rows: Array.from({ length: state.trackCount }, (_, i) => {
+          const row = state.seqRows[i];
+          return row ? { steps: row.steps.slice(0, state.seqSteps) } : null;
+        }),
+      },
+    },
+    payload,
+  };
+}
+
+function encodeProjectBytes() {
+  const { manifest, payload } = projectManifest();
+  const json = new TextEncoder().encode(JSON.stringify(manifest));
+  const total = 16 + json.byteLength + payload.reduce((n, part) => n + part.byteLength, 0);
+  const out = new ArrayBuffer(total);
+  const view = new DataView(out);
+  for (let i = 0; i < PROJECT_MAGIC.length; i++) {
+    view.setUint8(i, PROJECT_MAGIC.charCodeAt(i));
+  }
+  view.setUint32(8, PROJECT_VERSION, true);
+  view.setUint32(12, json.byteLength, true);
+
+  const bytes = new Uint8Array(out);
+  bytes.set(json, 16);
+  let offset = 16 + json.byteLength;
+  for (const part of payload) {
+    bytes.set(new Uint8Array(part), offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+function encodeProject() {
+  return new Blob([encodeProjectBytes()], { type: PROJECT_MIME });
+}
+
+// Rejects critical corruption and clamps the harmless ranges. This runs before
+// any audio is decoded or any current state is touched.
+function normalizeProjectManifest(m, payloadLength) {
+  if (!isPlainObject(m)) throw new Error("This project has no manifest.");
+  if (m.format !== PROJECT_FORMAT) throw new Error("This is not a Loupeur project.");
+  if (m.version !== PROJECT_VERSION) throw new Error("This project version is not supported.");
+
+  const gui = m.gui;
+  if (!isPlainObject(gui)) throw new Error("This project has no GUI state.");
+  const bpm = Number(gui.bpm);
+  if (!Number.isFinite(bpm) || bpm < 60 || bpm > 180) throw new Error("This project has an invalid BPM.");
+  const bars = Number(gui.bars);
+  if (bars !== 1 && bars !== 2 && bars !== 4 && bars !== 8) {
+    throw new Error("This project has an invalid bar count.");
+  }
+  const mode = gui.mode === "tempo" || gui.mode === "free" ? gui.mode : null;
+  if (!mode) throw new Error("This project has an invalid recording mode.");
+  const master = Number(gui.master);
+  if (!Number.isFinite(master) || master < 0 || master > 1) {
+    throw new Error("This project has an invalid master level.");
+  }
+  const playMode = gui.playMode === "loop" || gui.playMode === "sequence" ? gui.playMode : null;
+  if (!playMode) throw new Error("This project has an invalid playback mode.");
+  const seqSteps = Number(gui.seqSteps);
+  if (!SEQ_STEP_OPTIONS.includes(seqSteps)) {
+    throw new Error("This project has an invalid sequencer length.");
+  }
+  const selectedTrack = Number(gui.selectedTrack);
+  if (!Number.isFinite(selectedTrack)) throw new Error("This project has an invalid selected track.");
+
+  if (!Array.isArray(m.tracks) || m.tracks.length < 1 || m.tracks.length > MAX_TRACKS) {
+    throw new Error("This project has an invalid track count.");
+  }
+
+  const tracks = m.tracks.map((t) => {
+    if (!isPlainObject(t)) throw new Error("This project has an invalid track.");
+    const volume = Number(t.volume);
+    if (!Number.isFinite(volume)) throw new Error("This project has an invalid track level.");
+    const layers = Number(t.layers);
+    if (!Number.isFinite(layers) || layers < 0) {
+      throw new Error("This project has an invalid layer count.");
+    }
+
+    let audio = null;
+    if (t.audio !== null && t.audio !== undefined) {
+      if (!isPlainObject(t.audio)) throw new Error("This project has an invalid audio reference.");
+      const a = t.audio;
+      if (a.encoding !== "wav-pcm16") {
+        throw new Error("This project uses an unsupported audio encoding.");
+      }
+      const offset = Number(a.offset);
+      const length = Number(a.length);
+      const channels = Number(a.channels);
+      const frames = Number(a.frames);
+      const sampleRate = Number(a.sampleRate);
+      if (!Number.isInteger(offset) || offset < 0) {
+        throw new Error("This project has an invalid audio offset.");
+      }
+      if (!Number.isInteger(length) || length < 44) {
+        throw new Error("This project has an invalid audio length.");
+      }
+      if (offset + length > payloadLength) throw new Error("This project's audio is truncated.");
+      if (!Number.isInteger(channels) || channels < 1 || channels > 2) {
+        throw new Error("This project has an invalid channel count.");
+      }
+      if (!Number.isInteger(frames) || frames < 1) {
+        throw new Error("This project has an invalid frame count.");
+      }
+      if (!Number.isFinite(sampleRate) || sampleRate <= 0) {
+        throw new Error("This project has an invalid sample rate.");
+      }
+      audio = { offset, length, encoding: a.encoding, channels, frames, sampleRate };
+    }
+
+    return {
+      volume: Math.max(0, Math.min(1, volume)),
+      muted: Boolean(t.muted),
+      layers: Math.max(0, Math.floor(layers)),
+      audio,
+    };
+  });
+
+  const loop = m.loop;
+  if (!isPlainObject(loop)) throw new Error("This project has no loop information.");
+  const loopFrames = Number(loop.frames);
+  const loopSampleRate = Number(loop.sampleRate);
+  if (!Number.isInteger(loopFrames) || loopFrames < 0) {
+    throw new Error("This project has an invalid loop length.");
+  }
+  if (!Number.isFinite(loopSampleRate) || loopSampleRate < 0) {
+    throw new Error("This project has an invalid loop sample rate.");
+  }
+  if (tracks.some((t) => t.audio) && loopSampleRate <= 0) {
+    throw new Error("This project has audio but no sample rate.");
+  }
+
+  const rows = new Array(tracks.length).fill(null);
+  if (m.sequencer !== undefined) {
+    if (!isPlainObject(m.sequencer) || !Array.isArray(m.sequencer.rows)) {
+      throw new Error("This project has an invalid sequencer.");
+    }
+    for (let i = 0; i < tracks.length; i++) {
+      const row = m.sequencer.rows[i];
+      if (!row) continue;
+      if (!tracks[i].audio) continue;
+      if (!isPlainObject(row) || !Array.isArray(row.steps)) {
+        throw new Error("This project has an invalid sequencer row.");
+      }
+      const steps = new Array(seqSteps).fill(false);
+      for (let s = 0; s < seqSteps; s++) steps[s] = Boolean(row.steps[s]);
+      rows[i] = { steps };
+    }
+  }
+
+  return {
+    format: PROJECT_FORMAT,
+    version: PROJECT_VERSION,
+    savedAt: typeof m.savedAt === "string" ? m.savedAt : "",
+    gui: {
+      bpm,
+      bars,
+      mode,
+      clickOn: Boolean(gui.clickOn),
+      clickWhileRecording: Boolean(gui.clickWhileRecording),
+      reverbOn: Boolean(gui.reverbOn),
+      master,
+      playMode,
+      seqLoop: Boolean(gui.seqLoop),
+      seqSteps,
+      selectedTrack: Math.max(0, Math.min(tracks.length - 1, Math.floor(selectedTrack))),
+    },
+    loop: { frames: loopFrames, sampleRate: loopSampleRate },
+    tracks,
+    sequencer: { rows },
+  };
+}
+
+function readProject(data) {
+  // Object.prototype.toString rather than instanceof: an ArrayBuffer handed in
+  // from another realm (a test harness, an iframe) is still a valid buffer.
+  if (Object.prototype.toString.call(data) !== "[object ArrayBuffer]" || data.byteLength < 16) {
+    throw new Error("This is not a Loupeur project.");
+  }
+  const view = new DataView(data);
+  let magic = "";
+  for (let i = 0; i < PROJECT_MAGIC.length; i++) {
+    magic += String.fromCharCode(view.getUint8(i));
+  }
+  if (magic !== PROJECT_MAGIC) throw new Error("This is not a Loupeur project.");
+
+  const version = view.getUint32(8, true);
+  if (version > PROJECT_VERSION) {
+    throw new Error("This project was saved by a newer version of Loupeur.");
+  }
+  if (version !== PROJECT_VERSION) throw new Error("This project version is not supported.");
+
+  const manifestLength = view.getUint32(12, true);
+  if (manifestLength < 2 || 16 + manifestLength > data.byteLength) {
+    throw new Error("This project is truncated.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(new Uint8Array(data, 16, manifestLength)));
+  } catch (_) {
+    throw new Error("This project's manifest is not valid JSON.");
+  }
+
+  const payloadStart = 16 + manifestLength;
+  const payloadLength = data.byteLength - payloadStart;
+  return {
+    manifest: normalizeProjectManifest(parsed, payloadLength),
+    payloadStart,
+    payloadLength,
+    data,
+  };
+}
+
+// Decodes each WAV at the current AudioContext rate. decodeAudioData resamples,
+// so a project saved at 48 kHz still opens at 44.1 kHz with the same duration.
+async function decodeProjectTracks(project) {
+  const tracks = project.manifest.tracks;
+  const decoded = new Array(tracks.length).fill(null);
+  let loopLength = 0;
+
+  for (let i = 0; i < tracks.length; i++) {
+    const entry = tracks[i].audio;
+    if (!entry) continue;
+    const start = project.payloadStart + entry.offset;
+    const bytes = project.data.slice(start, start + entry.length);
+    const buffer = await decodeWav(bytes);
+    if (buffer.numberOfChannels !== entry.channels) {
+      throw new Error(`Track ${i + 1} has the wrong channel count.`);
+    }
+    const expected = entry.frames * ctx.sampleRate / entry.sampleRate;
+    if (Math.abs(buffer.length - expected) > 2) {
+      throw new Error(`Track ${i + 1} does not match its saved duration.`);
+    }
+    if (!loopLength) loopLength = buffer.length;
+    else if (Math.abs(buffer.length - loopLength) > 2) {
+      throw new Error("The tracks in this project have different lengths.");
+    }
+    decoded[i] = buffer;
+  }
+
+  if (loopLength) {
+    const lf = project.manifest.loop.frames;
+    const lr = project.manifest.loop.sampleRate;
+    if (lf > 0 && lr > 0) {
+      const expected = lf * ctx.sampleRate / lr;
+      if (Math.abs(loopLength - expected) > 2) {
+        throw new Error("The project's loop length does not match its audio.");
+      }
+    }
+  }
+
+  return { decoded, loopLength };
+}
+
+function syncProjectControls() {
+  el.bpm.value = String(state.bpm);
+  el.bpmOut.textContent = String(state.bpm);
+  el.bars.value = String(state.bars);
+  el.click.checked = state.clickOn;
+  el.clickRec.checked = state.clickWhileRecording;
+  el.reverb.checked = state.reverbOn;
+  const master = Math.round(state.master * 100);
+  el.master.value = String(master);
+  el.masterOut.textContent = String(master);
+  el.seqLoop.checked = state.seqLoop;
+  el.seqLength.value = String(state.seqSteps);
+  el.stems.checked = false;
+  for (const b of el.mode.children) b.classList.toggle("on", b.dataset.mode === state.mode);
+}
+
+// Replaces the current session with a validated project. Channels are built
+// before the old ones are retired, so a failure while building leaves the
+// current session intact.
+function applyProject(manifest, decoded) {
+  if (!ctx) throw new Error("Audio is not ready.");
+  if (!Array.isArray(decoded) || decoded.length !== manifest.tracks.length) {
+    throw new Error("This project has an invalid track list.");
+  }
+
+  let loopLength = 0;
+  for (const buffer of decoded) {
+    if (!buffer) continue;
+    if (!loopLength) loopLength = buffer.length;
+    else if (Math.abs(buffer.length - loopLength) > 2) {
+      throw new Error("The tracks in this project have different lengths.");
+    }
+  }
+
+  const nextChannels = [];
+  for (let i = 0; i < manifest.tracks.length; i++) createChannel(i, nextChannels);
+
+  stopTransport();
+  stopArmTimer();
+  stopCountIn();
+  pendingRecord = null;
+  liveEnv = null;
+
+  for (const ch of state.channels) {
+    if (ch.source) {
+      try { ch.source.stop(); } catch (_) {}
+      ch.source = null;
+    }
+    if (ch.gain) ch.gain.disconnect();
+    if (ch.seqGain) ch.seqGain.disconnect();
+  }
+  state.channels = nextChannels;
+
+  state.trackCount = manifest.tracks.length;
+  state.volumes = manifest.tracks.map((t) => t.volume);
+  state.seqRows = manifest.sequencer.rows.map((row) =>
+    row ? { steps: row.steps.slice() } : null
+  );
+  state.bpm = manifest.gui.bpm;
+  state.bars = manifest.gui.bars;
+  state.mode = manifest.gui.mode;
+  state.clickOn = manifest.gui.clickOn;
+  state.clickWhileRecording = manifest.gui.clickWhileRecording;
+  state.reverbOn = manifest.gui.reverbOn;
+  state.master = manifest.gui.master;
+  state.playMode = manifest.gui.playMode;
+  state.seqLoop = manifest.gui.seqLoop;
+  state.seqSteps = manifest.gui.seqSteps;
+  state.selected = Math.max(0, Math.min(state.trackCount - 1, manifest.gui.selectedTrack));
+  state.loopLength = loopLength;
+  state.t0 = 0;
+  nextBoundaryIndex = 0;
+  nextBeatIndex = 0;
+  state.freshLoop = Boolean(loopLength);
+
+  const now = ctx.currentTime;
+  for (let i = 0; i < state.trackCount; i++) {
+    const ch = state.channels[i];
+    const track = manifest.tracks[i];
+    const buffer = decoded[i] || null;
+    ch.buffer = buffer;
+    ch.state = buffer ? "playing" : "empty";
+    ch.layers = buffer ? Math.max(1, track.layers) : 0;
+    ch.muted = Boolean(track.muted) && Boolean(buffer);
+    ch.muteAt = 0;
+    ch.envBuffer = null;
+    ch.env = null;
+    ch.gain.gain.cancelScheduledValues(now);
+    ch.gain.gain.setValueAtTime(channelTarget(ch), now);
+    ch.seqGain.gain.cancelScheduledValues(now);
+    ch.seqGain.gain.setValueAtTime(1, now);
+  }
+
+  // Tempo Lock is only valid while its grid and the audio agree. A project
+  // saved at another sample rate, or one whose BPM was changed after recording,
+  // must not be allowed to redefine the loop under the audio.
+  let modeAdjusted = false;
+  if (state.mode === "tempo" && loopLength) {
+    const grid = Math.round(state.bars * 4 * (60 / state.bpm) * ctx.sampleRate);
+    if (Math.abs(grid - loopLength) > 2) {
+      state.mode = "free";
+      modeAdjusted = true;
+    }
+  }
+
+  masterGain.gain.cancelScheduledValues(now);
+  masterGain.gain.setValueAtTime(state.master, now);
+  wetGain.gain.cancelScheduledValues(now);
+  wetGain.gain.setValueAtTime(state.reverbOn ? 0.35 : 0, now);
+
+  rebuildTracks();
+  syncProjectControls();
+  seqSignature = "";
+  seqPlayhead = -1;
+  render();
+
+  return { modeAdjusted };
+}
+
+function saveProjectFile() {
+  if (savingProject || loadingProject) return;
+  if (pendingRecord || calibration || importing || exportingStems) {
+    showBanner("Wait for the current take or operation to finish before saving a project.");
+    return;
+  }
+
+  savingProject = true;
+  render();
+  try {
+    const name = projectFileName();
+    download(encodeProject(), name);
+    showBanner(`Saved ${name}.`);
+  } catch (err) {
+    console.warn("[loupeur] project save failed:", err);
+    showBanner("Could not save project: " + err.message);
+  } finally {
+    savingProject = false;
+    render();
+  }
+}
+
+async function loadProjectFile(file) {
+  if (!file || loadingProject) return;
+  if (!isProjectFilename(file.name)) {
+    showBanner("Choose a .loupeur project file.");
+    return;
+  }
+  if (savingProject || pendingRecord || calibration || importing || exportingStems) {
+    showBanner("Wait for the current take or operation to finish before loading a project.");
+    return;
+  }
+  if (state.channels.some((ch) => ch.buffer) &&
+      !window.confirm("Load this project and replace the current session?")) {
+    return;
+  }
+
+  loadingProject = true;
+  render();
+  try {
+    const data = await file.arrayBuffer();
+    const project = readProject(data);
+    await initAudio();
+    const { decoded, loopLength } = await decodeProjectTracks(project);
+    const { modeAdjusted } = applyProject(project.manifest, decoded);
+    const tracks = decoded.filter(Boolean).length;
+    const seconds = loopLength ? (loopLength / ctx.sampleRate).toFixed(2) : "0.00";
+    showBanner(
+      `Loaded ${file.name} — ${tracks} track${tracks === 1 ? "" : "s"}, ${seconds} s.` +
+      (modeAdjusted ? " The saved grid did not match the audio; loaded in Free mode." : "")
+    );
+  } catch (err) {
+    console.warn("[loupeur] project load failed:", err);
+    showBanner("Could not load project: " + err.message);
+  } finally {
+    loadingProject = false;
+    if (el.projectFile) el.projectFile.blur();
+    render();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,6 +2424,7 @@ function clearChannel(ch) {
   const remaining = state.channels.filter((c) => c.buffer);
   if (!remaining.length) {
     state.loopLength = 0;
+    state.freshLoop = false;
     stopTransport();
   } else if (state.mode === "free") {
     state.loopLength = remaining[0].buffer.length;
@@ -1913,7 +2647,7 @@ async function exportStems() {
   showBanner(`Saved ${count} to ${dir.name}.`);
 }
 
-function encodeWav(buffer, frames) {
+function encodeWavBytes(buffer, frames) {
   const channels = buffer.numberOfChannels;
   const rate = buffer.sampleRate;
   const data = [];
@@ -1949,7 +2683,11 @@ function encodeWav(buffer, frames) {
       off += 2;
     }
   }
-  return new Blob([out], { type: "audio/wav" });
+  return out;
+}
+
+function encodeWav(buffer, frames) {
+  return new Blob([encodeWavBytes(buffer, frames)], { type: "audio/wav" });
 }
 
 function download(blob, name) {
@@ -1990,7 +2728,15 @@ function envelopeFor(ch) {
   if (!ch.buffer) return null;
   if (ch.envBuffer === ch.buffer) return ch.env;
   ch.envBuffer = ch.buffer;
+  // Imported tracks may be stereo. Take the peak across channels so a mix that
+  // leans to one side still draws a waveform.
   ch.env = computeEnvelope(ch.buffer.getChannelData(0), WAVE_BUCKETS);
+  for (let c = 1; c < ch.buffer.numberOfChannels; c++) {
+    const other = computeEnvelope(ch.buffer.getChannelData(c), WAVE_BUCKETS);
+    for (let b = 0; b < ch.env.length; b++) {
+      if (other[b] > ch.env[b]) ch.env[b] = other[b];
+    }
+  }
   return ch.env;
 }
 
@@ -2328,6 +3074,7 @@ function removeTrack(i) {
 }
 
 async function onPrimary(i) {
+  if (loadingProject) return;
   await initAudio();
   // The button is disabled in SEQUENCE mode, but the R shortcut reaches this
   // directly, so the guard has to live here too.
@@ -2463,7 +3210,9 @@ function render() {
     const removeBtn = tile.querySelector("[data-remove]");
     if (removeBtn) {
       removeBtn.disabled =
-        state.trackCount <= 1 || Boolean(ch && (ch.buffer || ch.state !== "empty"));
+        loadingProject ||
+        state.trackCount <= 1 ||
+        Boolean(ch && (ch.buffer || ch.state !== "empty"));
     }
 
     // Before the first record press the channels do not exist yet. The tile is
@@ -2491,7 +3240,7 @@ function render() {
     const seqOnly = state.playMode === "sequence";
     primary.textContent = seqOnly ? "LOOP ONLY" : labels[ch.state] || "RECORD";
     primary.dataset.state = ch.state;
-    primary.disabled = Boolean(locked) || seqOnly;
+    primary.disabled = Boolean(locked) || seqOnly || loadingProject;
 
     const mute = tile.querySelector("[data-mute]");
     mute.classList.toggle("latched", ch.muted);
@@ -2533,12 +3282,28 @@ function render() {
   }
 
   const hasAudio = state.channels.some((c) => c.buffer);
-  el.exportBtn.disabled = !hasAudio;
-  if (el.exportSeq) el.exportSeq.disabled = !sequenceExportTracks().length;
+  el.exportBtn.disabled = !hasAudio || loadingProject;
+  if (el.exportSeq) {
+    el.exportSeq.disabled = loadingProject || !sequenceExportTracks().length;
+  }
   // The stems checkbox is an action, not a mode: it is only live while there is
   // something to write and no export is already running.
-  el.stems.disabled = exportingStems || !hasAudio;
-  if (el.addTrack) el.addTrack.disabled = state.trackCount >= MAX_TRACKS;
+  el.stems.disabled = exportingStems || loadingProject || !hasAudio;
+  if (el.addTrack) {
+    el.addTrack.disabled = loadingProject || state.trackCount >= MAX_TRACKS;
+  }
+  if (el.importWav) {
+    el.importWav.disabled = !canImport();
+    el.importWav.textContent = importing ? "IMPORTING…" : "Import WAV";
+  }
+  if (el.saveProject) {
+    el.saveProject.disabled = projectBusy();
+    el.saveProject.textContent = savingProject ? "SAVING…" : "Save";
+  }
+  if (el.loadProject) {
+    el.loadProject.disabled = projectBusy();
+    el.loadProject.textContent = loadingProject ? "LOADING…" : "Load";
+  }
   if (el.seqLength) el.seqLength.value = String(state.seqSteps);
 
   // The offset readout shows the number actually in force for the open device:
@@ -2553,12 +3318,12 @@ function render() {
 
   // Calibration owns the mic while it runs, so nothing else may start a take.
   const busy = Boolean(calibration);
-  el.calibrate.disabled = busy;
+  el.calibrate.disabled = busy || loadingProject;
   el.calibrate.textContent = busy ? "Calibrating…" : "Calibrate";
 
   el.modeHelp.textContent =
     state.mode === "free"
-      ? "Free Mode: the first take sets the loop length. Later tracks must match it."
+      ? "Free Mode: the first take or an imported WAV sets the loop length. Later tracks must match it."
       : `Tempo Lock: ${state.bars} bar${state.bars > 1 ? "s" : ""} at ${state.bpm} BPM. Recording snaps to the grid.`;
 
   renderSequencer();
@@ -2618,6 +3383,36 @@ function bindControls() {
   }
 
   if (el.addTrack) el.addTrack.addEventListener("click", addTrack);
+
+  if (el.importWav && el.importFile) {
+    el.importWav.addEventListener("click", () => {
+      if (el.importWav.disabled) return;
+      el.importFile.click();
+    });
+    el.importFile.addEventListener("change", () => {
+      const file = el.importFile.files && el.importFile.files[0];
+      // Reset so picking the same file again still fires a change event.
+      el.importFile.value = "";
+      el.importFile.blur();
+      if (file) importWav(file).catch((err) => showBanner("Import failed: " + err.message));
+    });
+  }
+
+  if (el.saveProject) {
+    el.saveProject.addEventListener("click", () => saveProjectFile());
+  }
+  if (el.loadProject && el.projectFile) {
+    el.loadProject.addEventListener("click", () => {
+      if (el.loadProject.disabled) return;
+      el.projectFile.click();
+    });
+    el.projectFile.addEventListener("change", () => {
+      const file = el.projectFile.files && el.projectFile.files[0];
+      el.projectFile.value = "";
+      el.projectFile.blur();
+      if (file) loadProjectFile(file).catch((err) => showBanner("Load failed: " + err.message));
+    });
+  }
 
   el.seqRows.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-seqrow]");
@@ -2731,7 +3526,10 @@ function toggleTransport() {
     stopTransport();
   } else if (state.loopLength) {
     rampMaster(state.master);
-    startTransport(nextBoundaryTime(ctx.currentTime + 0.05));
+    // A freshly imported file has no musical grid yet, so waiting for its next
+    // boundary could leave the user staring at a silent 38-second loop.
+    const at = state.freshLoop ? ctx.currentTime + 0.05 : nextBoundaryTime(ctx.currentTime + 0.05);
+    startTransport(at);
   }
   render();
 }

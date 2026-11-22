@@ -378,6 +378,7 @@ input.nb-checkbox:checked::before {
 
 .tracks-actions {
   display: flex;
+  gap: 8px;
   justify-content: flex-end;
 }
 
